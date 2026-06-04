@@ -33,17 +33,17 @@ class MujocoServerCameraManagerSync:
 
         self.camera_renderers: dict[StretchCameras, mujoco.Renderer] = {}
 
+        self.camera_lock = threading.Lock()
+
+        # Queues for thread-safe camera management
+        self._cameras_to_add: list[StretchCameras] = []
+        self._cameras_to_remove: list[StretchCameras] = []
+
         self._set_camera_properties_and_create_renderers_in_mujoco(cameras_to_use)
 
         self.camera_fps_counter = FpsCounter()
 
         self.time_start = time.perf_counter()
-
-        self.camera_lock = threading.Lock()
-        
-        # Queues for thread-safe camera management
-        self._cameras_to_add: list[StretchCameras] = []
-        self._cameras_to_remove: list[StretchCameras] = []
 
     def close(self):
         """
