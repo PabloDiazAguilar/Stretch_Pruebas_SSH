@@ -15,12 +15,6 @@
     <texture type="2d" name="wood" file="wood.png"/>
     <material name="wood" texture="wood"/>
     <texture type="skybox" builtin="gradient" rgb1="0.44 0.80 1.00" rgb2="1 1 1" width="512" height="3072"/>
-
-    <!-- Marcadores ArUco: generados por generate_aruco.py -->
-    <texture type="2d" name="aruco0_tex" file="aruco_0.png"/>
-    <texture type="2d" name="aruco1_tex" file="aruco_1.png"/>
-    <material name="mat_aruco0" texture="aruco0_tex" texrepeat="1 1" specular="0" shininess="0"/>
-    <material name="mat_aruco1" texture="aruco1_tex" texrepeat="1 1" specular="0" shininess="0"/>
   </asset>
 
   <worldbody>
@@ -34,22 +28,16 @@
       <geom type="box" size=".6 .5 .24" mass="1" material="wood"/>
     </body>
 
-    <!-- Cubo azul (ArUco ID=0 en la cara superior) -->
+    <!-- Cubo azul -->
     <body name="cube_blue" pos="-.04 -0.55 .65">
       <freejoint/>
       <geom type="box" size=".04 .04 .04" mass=".3" rgba="0 0.2 1 1"/>
-      <!-- Marcador ArUco como capa fina encima del cubo -->
-      <geom type="box" pos="0 0 0.042" size=".036 .036 .001"
-            material="mat_aruco0" rgba="1 1 1 1"/>
     </body>
 
-    <!-- Cubo rojo (ArUco ID=1 en la cara superior) -->
+    <!-- Cubo rojo -->
     <body name="cube_red" pos=".12 -0.55 .65">
       <freejoint/>
       <geom type="box" size=".04 .04 .04" mass=".3" rgba="1 0.1 0 1"/>
-      <!-- Marcador ArUco como capa fina encima del cubo -->
-      <geom type="box" pos="0 0 0.042" size=".036 .036 .001"
-            material="mat_aruco1" rgba="1 1 1 1"/>
     </body>
   </worldbody>
 </mujoco>
