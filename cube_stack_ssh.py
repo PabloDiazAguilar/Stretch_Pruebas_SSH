@@ -1,28 +1,16 @@
 """
 Cube stacking demo - SSH compatible with third-person video recording.
 
-Usage:
-    # Linux SSH con GPU (NVIDIA/EGL):
-    export MUJOCO_GL=egl
-    python cube_stack_ssh.py
+Usage (local con ventana):
+    MUJOCO_GL=glfw python cube_stack_ssh.py
 
-    # Linux SSH sin GPU (software rendering, más lento):
-    export MUJOCO_GL=osmesa
-    python cube_stack_ssh.py
-
-    # Instalar dependencias si faltan:
-    sudo apt-get install libegl1 libegl-mesa0     # para EGL
-    sudo apt-get install libosmesa6               # para osmesa
-
-El robot detecta los cubos con la cámara de cabeza (D435i),
-agarra el cubo azul y lo coloca sobre el cubo rojo.
-La grabación de tercera persona se guarda en cube_stack_demo.mp4
+Usage (headless SSH con GPU):
+    MUJOCO_GL=egl python cube_stack_ssh.py
 """
 
 import os
-# CRÍTICO: setear ANTES de cualquier import de mujoco/stretch_mujoco
 if "MUJOCO_GL" not in os.environ:
-    os.environ["MUJOCO_GL"] = "egl"   # cambiar a "osmesa" si no hay GPU con EGL
+    os.environ["MUJOCO_GL"] = "egl"
 
 import sys
 import time
@@ -36,306 +24,313 @@ from stretch_mujoco import StretchMujocoSimulator
 from stretch_mujoco.enums.actuators import Actuators
 from stretch_mujoco.enums.stretch_cameras import StretchCameras
 
-# ── Rutas ────────────────────────────────────────────────────────────────────
-HERE = Path(__file__).parent
+# ── Config ────────────────────────────────────────────────────────────────────
+HERE      = Path(__file__).parent
 SCENE_XML = str(HERE / "stretch_mujoco/models/scene_cubes.xml")
-VIDEO_OUTPUT = str(HERE / "cube_stack_demo.mp4")
-
-# ── Parámetros de video ───────────────────────────────────────────────────────
+VIDEO_OUT = str(HERE / "cube_stack_demo.mp4")
+HEADLESS  = True          # False para ver ventana MuJoCo (requiere pantalla)
 VIDEO_FPS = 10
-VIDEO_W, VIDEO_H = 640, 480   # debe coincidir con cam_overhead initial_camera_settings
+VIDEO_W, VIDEO_H = 640, 480
 
-# ── Cámaras a activar ────────────────────────────────────────────────────────
 CAMERAS = [
-    StretchCameras.cam_d435i_rgb,    # cabeza RGB  → detección de cubos
-    StretchCameras.cam_d435i_depth,  # cabeza depth → distancia al cubo
-    StretchCameras.cam_d405_rgb,     # muñeca RGB  → confirmación de agarre
-    StretchCameras.cam_overhead,     # tercera persona → grabación de video
+    StretchCameras.cam_d435i_rgb,
+    StretchCameras.cam_d435i_depth,
+    StretchCameras.cam_d405_rgb,
+    StretchCameras.cam_overhead,
 ]
 
-# ── Rangos HSV para detección de colores ─────────────────────────────────────
-BLUE_LOW  = np.array([100, 100, 50])
-BLUE_HIGH = np.array([130, 255, 255])
-RED_LOW1  = np.array([0,   120, 50])
-RED_HIGH1 = np.array([10,  255, 255])
-RED_LOW2  = np.array([170, 120, 50])
-RED_HIGH2 = np.array([180, 255, 255])
+# Posiciones de los cubos en la escena (de scene_cubes.xml, tras caer sobre la mesa)
+# Mesa top z ≈ 0.48, cubos mitad-alto = 0.04 → centro en z ≈ 0.52
+CUBE_BLUE_XYZ = np.array([-0.04, -0.55, 0.52])
+CUBE_RED_XYZ  = np.array([ 0.12, -0.55, 0.52])
 
-# ── Parámetros del robot  ─────────────────────────────────────────────────────
-# AJUSTAR según posición real del robot en la escena (usar teleop_demo.py primero).
-# La escena tiene el robot al origen y la mesa en y=-1.
-# Los cubos quedan en x≈-0.04 y x≈0.12, y≈-0.55, z≈0.52 tras caer.
+GRIPPER_OPEN  =  0.04
+GRIPPER_CLOSE = -0.015
+ARM_PROBE_DIST = 0.12   # metros para probar dirección del brazo
 
-LIFT_HOVER    = 0.55    # altura hover sobre la mesa (m)
-LIFT_GRASP    = 0.46    # altura para agarrar el cubo (m)  ← bajar si no toca
-LIFT_CARRY    = 0.72    # altura al transportar
-LIFT_PLACE    = 0.60    # altura para soltar sobre cubo rojo
+# ── Utilidades ────────────────────────────────────────────────────────────────
 
-ARM_BLUE      = 0.40    # extensión de brazo para llegar al cubo azul (m)
-ARM_RED       = 0.40    # extensión para el cubo rojo (similar y)
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-WRIST_DOWN    = -0.9    # wrist_pitch apuntando al suelo
-GRIPPER_OPEN  =  0.04   # gripper abierto
-GRIPPER_CLOSE = -0.015  # gripper cerrado (agarre)
+def move(sim, actuator, pos, timeout=8.0):
+    sim.move_to(actuator, pos)
+    sim.wait_while_is_moving(actuator, timeout=timeout)
 
-HEAD_TILT_TABLE = -0.85   # inclinar cabeza para ver la mesa
+def ee_pos(sim):
+    """Posición del end-effector en frame mundo (x, y, z)."""
+    return sim.get_ee_pose()[:3, 3].copy()
 
+# ── Calibración automática de geometría del brazo ────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Detección de cubos con cámara
-# ─────────────────────────────────────────────────────────────────────────────
+def probe_arm_geometry(sim):
+    """
+    Mueve el brazo un poco y mide en qué dirección se mueve el gripper.
+    Devuelve (arm_dir_xy, ee_z_at_lift0, lift_z_ratio).
+    """
+    log("Calibrando geometría del brazo...")
 
-def find_cube_center(frame_bgr: np.ndarray | None, color: str) -> tuple[int, int] | None:
-    """Devuelve el pixel central del cubo más grande del color dado, o None."""
+    # Llevar a posición de referencia limpia
+    move(sim, Actuators.lift, 0.5, timeout=10)
+    move(sim, Actuators.arm,  0.0, timeout=10)
+    time.sleep(0.5)
+
+    ee0 = ee_pos(sim)
+    log(f"  EE en lift=0.5 arm=0: {np.round(ee0, 3)}")
+
+    # Probar lift: subir 0.1 m
+    move(sim, Actuators.lift, 0.6, timeout=6)
+    ee_lift = ee_pos(sim)
+    dz_per_lift = (ee_lift[2] - ee0[2]) / 0.1   # ≈ 1.0
+    move(sim, Actuators.lift, 0.5, timeout=6)
+    log(f"  dz/d_lift ≈ {dz_per_lift:.2f}")
+
+    # Probar brazo: extender ARM_PROBE_DIST
+    move(sim, Actuators.arm, ARM_PROBE_DIST, timeout=8)
+    time.sleep(0.4)
+    ee_arm = ee_pos(sim)
+    d_arm = ee_arm[:2] - ee0[:2]          # delta xy al extender
+    arm_dir = d_arm / (np.linalg.norm(d_arm) + 1e-9)
+    move(sim, Actuators.arm, 0.0, timeout=8)
+    time.sleep(0.3)
+
+    log(f"  Dirección del brazo (xy): {np.round(arm_dir, 3)}")
+    log(f"  EE xy origen: {np.round(ee0[:2], 3)}")
+
+    # z del EE cuando lift=0.5 y arm=0
+    ee_ref = ee_pos(sim)
+    return arm_dir, ee_ref, dz_per_lift
+
+# ── Control de base ───────────────────────────────────────────────────────────
+
+def move_base_to(sim, tx, ty, tolerance=0.06, timeout=20.0):
+    """Mueve la base al punto (tx, ty) con control proporcional."""
+    KP_LIN = 1.5
+    KP_ANG = 3.0
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = sim.pull_status()
+        dx = tx - st.base.x
+        dy = ty - st.base.y
+        dist = np.hypot(dx, dy)
+        if dist < tolerance:
+            break
+        ang_target = np.arctan2(dy, dx)
+        ang_err = (ang_target - st.base.theta + np.pi) % (2 * np.pi) - np.pi
+        if abs(ang_err) > 0.4:
+            sim.set_base_velocity(0, KP_ANG * ang_err)
+        else:
+            sim.set_base_velocity(min(KP_LIN * dist, 0.25),
+                                  KP_ANG * ang_err)
+        time.sleep(0.04)
+    sim.set_base_velocity(0, 0)
+    time.sleep(0.3)
+    st = sim.pull_status()
+    log(f"  Base final: ({st.base.x:.3f}, {st.base.y:.3f})")
+
+# ── Detección de cubos ────────────────────────────────────────────────────────
+
+BLUE_LO, BLUE_HI = np.array([100,100,50]), np.array([130,255,255])
+RED_LO1, RED_HI1 = np.array([0,120,50]),   np.array([10,255,255])
+RED_LO2, RED_HI2 = np.array([170,120,50]), np.array([180,255,255])
+
+def find_cube(frame_bgr, color):
     if frame_bgr is None or frame_bgr.ndim != 3:
         return None
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    if color == "blue":
-        mask = cv2.inRange(hsv, BLUE_LOW, BLUE_HIGH)
-    else:  # red
-        mask = cv2.bitwise_or(
-            cv2.inRange(hsv, RED_LOW1, RED_HIGH1),
-            cv2.inRange(hsv, RED_LOW2, RED_HIGH2),
-        )
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    mask = (cv2.inRange(hsv, BLUE_LO, BLUE_HI) if color == "blue"
+            else cv2.bitwise_or(cv2.inRange(hsv, RED_LO1, RED_HI1),
+                                cv2.inRange(hsv, RED_LO2, RED_HI2)))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
         return None
-    best = max(contours, key=cv2.contourArea)
+    best = max(cnts, key=cv2.contourArea)
     if cv2.contourArea(best) < 50:
         return None
     M = cv2.moments(best)
     if M["m00"] == 0:
         return None
-    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+    return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
 
+# ── Pick and place ────────────────────────────────────────────────────────────
 
-def annotate_frame(frame: np.ndarray, blue_c, red_c, label: str = "") -> np.ndarray:
-    """Dibuja detecciones y etiqueta en el frame (para el video)."""
-    out = frame.copy()
-    if blue_c:
-        cv2.circle(out, blue_c, 18, (255, 80, 0), 3)
-        cv2.putText(out, "BLUE", (blue_c[0] + 20, blue_c[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 80, 0), 2)
-    if red_c:
-        cv2.circle(out, red_c, 18, (0, 50, 255), 3)
-        cv2.putText(out, "RED", (red_c[0] + 20, red_c[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 50, 255), 2)
-    if label:
-        cv2.putText(out, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 0), 2)
-    return out
-
-
-def get_cube_depth_m(sim: StretchMujocoSimulator, pixel: tuple[int, int]) -> float | None:
-    """Lee profundidad en metros en el pixel dado de la cámara de cabeza."""
-    try:
-        cam_data = sim.pull_camera_data()
-        depth = cam_data.get_camera_data(StretchCameras.cam_d435i_depth, auto_correct_rgb=False)
-        if depth is None:
-            return None
-        x, y = pixel
-        h, w = depth.shape[:2]
-        if not (0 <= x < w and 0 <= y < h):
-            return None
-        val = float(depth[y, x])
-        if val <= 0:
-            return None
-        return val * 1e-3   # escala D435i
-    except Exception:
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Secuencia de pick-and-place
-# ─────────────────────────────────────────────────────────────────────────────
-
-def move(sim: StretchMujocoSimulator, actuator: Actuators, pos: float, timeout: float = 8.0):
-    """Mueve un actuador y espera a que llegue."""
-    sim.move_to(actuator, pos)
-    sim.wait_while_is_moving(actuator, timeout=timeout)
-
-
-def log(msg: str):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def run_pick_and_place(sim: StretchMujocoSimulator):
+def pick_and_place(sim, arm_dir, ee_ref, dz_per_lift):
     """
-    Ejecuta la secuencia de apilado de cubos.
-
-    NOTA: Los valores de LIFT_*, ARM_*, etc. al principio del archivo
-    necesitan ajuste fino según la posición real del robot en tu escena.
-    Usa teleop_demo.py primero para explorar los valores correctos.
+    Usa la geometría calibrada para agarrar el cubo azul
+    y colocarlo sobre el cubo rojo.
     """
 
-    # — 1. Esperar que los cubos caigan y se estabilicen ——————————————————————
-    log("Fase 1: Esperando que los cubos se estabilicen...")
-    time.sleep(3.0)
+    def compute_joints(target_xyz, arm_ext_margin=0.0):
+        """
+        Dado un target en mundo, calcula lift y arm necesarios.
+        Asume que la base ya está bien posicionada.
+        """
+        # Z: lift necesario para que el EE quede a la altura target
+        dz = target_xyz[2] - ee_ref[2]
+        lift_needed = 0.5 + dz / dz_per_lift
+        lift_needed = float(np.clip(lift_needed, 0.05, 1.0))
 
-    status = sim.pull_status()
-    ee = sim.get_ee_pose()
-    log(f"  Base: x={status.base.x:.3f} y={status.base.y:.3f} θ={status.base.theta:.3f} rad")
-    log(f"  EE home: [{ee[0,3]:.3f}, {ee[1,3]:.3f}, {ee[2,3]:.3f}]")
+        # XY: distancia desde EE_ref hasta target en dirección del brazo
+        d_xy = target_xyz[:2] - ee_ref[:2]
+        arm_needed = float(np.dot(d_xy, arm_dir)) + arm_ext_margin
+        arm_needed = float(np.clip(arm_needed, 0.0, 0.52))
+        return lift_needed, arm_needed
 
-    # — 2. Apuntar cámara a la mesa ───────────────────────────────────────────
-    log("Fase 2: Apuntando cámara de cabeza a la mesa...")
-    move(sim, Actuators.head_tilt, HEAD_TILT_TABLE)
-    move(sim, Actuators.head_pan, 0.0)
-    time.sleep(0.5)
+    # ── 1. Posicionar base para cubo azul ────────────────────────────────────
+    log("Fase: posicionando base frente al cubo azul...")
+    # La base debe estar en: cube_xy - arm_dir * arm_ext
+    # Dejamos arm_ext ≈ 0.35m para tener algo de margen
+    desired_arm = 0.35
+    base_target = CUBE_BLUE_XYZ[:2] - arm_dir * desired_arm
+    move_base_to(sim, base_target[0], base_target[1])
 
-    # — 3. Detectar cubos con cámara de cabeza ────────────────────────────────
-    log("Fase 3: Detectando cubos con cámara...")
-    cam_data = sim.pull_camera_data()
-    try:
-        head_rgb = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
-    except ValueError:
-        head_rgb = None
-
-    blue_pixel = find_cube_center(head_rgb, "blue")
-    red_pixel  = find_cube_center(head_rgb, "red")
-    log(f"  Cubo azul en pixel: {blue_pixel}")
-    log(f"  Cubo rojo en pixel: {red_pixel}")
-
-    if blue_pixel:
-        depth = get_cube_depth_m(sim, blue_pixel)
-        log(f"  Profundidad al cubo azul: {depth:.3f}m" if depth else "  Sin dato de profundidad")
-
-    # — 4. Preparar muñeca y altura de hover ──────────────────────────────────
-    log("Fase 4: Posicionando brazo sobre cubo azul...")
-    move(sim, Actuators.wrist_pitch, WRIST_DOWN, timeout=5.0)
-    move(sim, Actuators.wrist_yaw, 0.0, timeout=5.0)
-    move(sim, Actuators.lift, LIFT_HOVER)
-
-    # Abrir gripper antes de bajar
-    move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4.0)
-
-    # Extender brazo hacia cubo azul
-    move(sim, Actuators.arm, ARM_BLUE)
-    time.sleep(0.3)
-
-    # — 5. Bajar al cubo azul ─────────────────────────────────────────────────
-    log("Fase 5: Bajando al cubo azul...")
-    move(sim, Actuators.lift, LIFT_GRASP)
+    # ── 2. Apuntar cabeza y detectar ──────────────────────────────────────────
+    log("Fase: apuntando cámara a la mesa...")
+    move(sim, Actuators.head_tilt, -0.85, timeout=5)
+    move(sim, Actuators.head_pan,   0.0,  timeout=5)
     time.sleep(0.4)
 
-    # Confirmar con cámara de muñeca
     try:
         cam_data = sim.pull_camera_data()
-        wrist_rgb = cam_data.get_camera_data(StretchCameras.cam_d405_rgb)
-        wrist_blue = find_cube_center(wrist_rgb, "blue")
-        log(f"  Cubo azul en cámara de muñeca: {wrist_blue}")
-    except Exception:
-        pass
+        head_rgb = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
+        blue_px = find_cube(head_rgb, "blue")
+        red_px  = find_cube(head_rgb, "red")
+        log(f"  Cubo azul en pixel: {blue_px}  |  Cubo rojo en pixel: {red_px}")
+    except Exception as e:
+        log(f"  Detección de cámara falló: {e}")
 
-    # — 6. Cerrar gripper (agarrar) ───────────────────────────────────────────
-    log("Fase 6: Cerrando gripper (agarrando cubo azul)...")
-    move(sim, Actuators.gripper, GRIPPER_CLOSE, timeout=4.0)
-    time.sleep(0.6)
+    # ── 3. Preparar muñeca ────────────────────────────────────────────────────
+    log("Fase: preparando muñeca...")
+    move(sim, Actuators.wrist_pitch, -0.9, timeout=5)
+    move(sim, Actuators.wrist_yaw,    0.0, timeout=5)
+    move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
 
-    # — 7. Levantar el cubo ───────────────────────────────────────────────────
-    log("Fase 7: Levantando cubo azul...")
-    move(sim, Actuators.lift, LIFT_CARRY)
+    # ── 4. Calcular y mover al cubo azul ─────────────────────────────────────
+    # Recalcular ee_ref con la nueva posición de base
+    move(sim, Actuators.lift, 0.5, timeout=8)
+    move(sim, Actuators.arm,  0.0, timeout=8)
+    time.sleep(0.3)
+    ee_ref_now = ee_pos(sim)
+
+    def compute_joints_now(target_xyz, dz_offset=0.0):
+        dz = (target_xyz[2] + dz_offset) - ee_ref_now[2]
+        lift = float(np.clip(0.5 + dz / dz_per_lift, 0.05, 1.0))
+        d_xy = target_xyz[:2] - ee_ref_now[:2]
+        arm  = float(np.clip(np.dot(d_xy, arm_dir), 0.0, 0.50))
+        return lift, arm
+
+    log("Fase: moviendo sobre cubo azul...")
+    lift_hover, arm_blue = compute_joints_now(CUBE_BLUE_XYZ, dz_offset=0.06)
+    log(f"  lift={lift_hover:.3f}  arm={arm_blue:.3f}")
+    move(sim, Actuators.lift, lift_hover, timeout=8)
+    move(sim, Actuators.arm,  arm_blue,   timeout=8)
+    time.sleep(0.4)
+    log(f"  EE actual: {np.round(ee_pos(sim), 3)}")
+
+    # ── 5. Bajar y agarrar ────────────────────────────────────────────────────
+    log("Fase: bajando al cubo azul...")
+    lift_grasp, _ = compute_joints_now(CUBE_BLUE_XYZ, dz_offset=-0.01)
+    move(sim, Actuators.lift, lift_grasp, timeout=6)
+    time.sleep(0.4)
+
+    log("Fase: cerrando gripper...")
+    move(sim, Actuators.gripper, GRIPPER_CLOSE, timeout=4)
     time.sleep(0.5)
 
-    # — 8. Moverse sobre el cubo rojo ─────────────────────────────────────────
-    # Los cubos están separados ~16cm en x. Si el robot está alineado con el cubo azul
-    # en x, necesita moverse en x para llegar al rojo.
-    # Opción A: ajustar extensión del brazo si los cubos difieren en y.
-    # Opción B: mover base en x.
-    # Por ahora usamos la misma extensión (cubos a mismo y) y movemos base.
-    log("Fase 8: Moviéndose al cubo rojo...")
-
-    # Ajuste pequeño de base en x hacia el cubo rojo (+x respecto al azul)
-    # Velocidad lineal = 0, omega = 0, pero mover en x con set_base_velocity requiere
-    # orientar el robot. Alternativa: extender diferente si están a diferente distancia.
-    # Para esta escena los cubos están al mismo y, solo difieren en x ~0.16m.
-    # Si el robot está en posición default (facing +x), desplazar base +0.16 en y
-    # no es directo sin un controlador completo. Simplificamos asumiendo que el robot
-    # puede alcanzar ambos cubos sin mover la base (separación pequeña vs brazo).
-    move(sim, Actuators.arm, ARM_RED)
+    # ── 6. Levantar ───────────────────────────────────────────────────────────
+    log("Fase: levantando cubo azul...")
+    lift_carry, _ = compute_joints_now(CUBE_BLUE_XYZ, dz_offset=0.20)
+    move(sim, Actuators.lift, lift_carry, timeout=8)
     time.sleep(0.5)
 
-    # — 9. Bajar y soltar ─────────────────────────────────────────────────────
-    log("Fase 9: Colocando cubo azul sobre rojo...")
-    move(sim, Actuators.lift, LIFT_PLACE)
+    # ── 7. Posicionar sobre cubo rojo ────────────────────────────────────────
+    log("Fase: moviéndose al cubo rojo...")
+
+    # Mover base lateralmente si los cubos difieren mucho en x o y
+    base_target_red = CUBE_RED_XYZ[:2] - arm_dir * desired_arm
+    move_base_to(sim, base_target_red[0], base_target_red[1])
+
+    move(sim, Actuators.lift, 0.5, timeout=6)
+    move(sim, Actuators.arm,  0.0, timeout=6)
+    time.sleep(0.3)
+    ee_ref_now = ee_pos(sim)
+
+    # Hover sobre cubo rojo (encima del cubo rojo + alto del cubo azul)
+    lift_over, arm_red = compute_joints_now(CUBE_RED_XYZ, dz_offset=0.10)
+    log(f"  lift={lift_over:.3f}  arm={arm_red:.3f}")
+    move(sim, Actuators.lift, lift_over, timeout=8)
+    move(sim, Actuators.arm,  arm_red,   timeout=8)
+    time.sleep(0.4)
+
+    # ── 8. Bajar y soltar ────────────────────────────────────────────────────
+    log("Fase: colocando cubo azul sobre rojo...")
+    lift_place, _ = compute_joints_now(CUBE_RED_XYZ, dz_offset=0.06)
+    move(sim, Actuators.lift, lift_place, timeout=6)
+    time.sleep(0.4)
+
+    move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
     time.sleep(0.5)
 
-    move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4.0)
-    time.sleep(0.5)
-
-    # — 10. Retirar brazo ─────────────────────────────────────────────────────
-    log("Fase 10: Retirando brazo...")
-    move(sim, Actuators.lift, LIFT_CARRY)
-    move(sim, Actuators.arm, 0.05)
+    # ── 9. Retirar ───────────────────────────────────────────────────────────
+    log("Fase: retirando brazo...")
+    move(sim, Actuators.lift, lift_carry, timeout=6)
+    move(sim, Actuators.arm,  0.0,        timeout=6)
     time.sleep(1.0)
+    log("¡Completado!")
 
-    log("¡Secuencia completada!")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Grabación de video (hilo separado)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Grabación de video ────────────────────────────────────────────────────────
 
 class VideoRecorder:
-    def __init__(self, sim: StretchMujocoSimulator, path: str):
+    def __init__(self, sim, path):
         self.sim = sim
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(path, fourcc, VIDEO_FPS, (VIDEO_W, VIDEO_H))
+        self.label = ""
         self._running = False
-        self._thread: threading.Thread | None = None
-        self.phase_label: str = ""
 
     def _loop(self):
         interval = 1.0 / VIDEO_FPS
         while self._running and self.sim.is_running():
             t0 = time.perf_counter()
             try:
-                cam_data = self.sim.pull_camera_data()
-                # --- frame de tercera persona (overhead) ---
-                overhead = cam_data.get_camera_data(StretchCameras.cam_overhead)
-                # --- frame de cabeza para detectar cubos ---
+                cam = self.sim.pull_camera_data()
+                frame = cam.get_camera_data(StretchCameras.cam_overhead)
+                # overlay de detección
                 try:
-                    head = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
-                    blue_c = find_cube_center(head, "blue")
-                    red_c  = find_cube_center(head, "red")
+                    head = cam.get_camera_data(StretchCameras.cam_d435i_rgb)
+                    bc = find_cube(head, "blue")
+                    rc = find_cube(head, "red")
+                    if bc: cv2.circle(frame, bc, 15, (255,80,0), 3)
+                    if rc: cv2.circle(frame, rc, 15, (0,50,255), 3)
                 except Exception:
-                    blue_c = red_c = None
-
-                frame = annotate_frame(overhead, blue_c, red_c, self.phase_label)
-
-                # Asegurar tamaño correcto
+                    pass
+                if self.label:
+                    cv2.putText(frame, self.label, (10,30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,220,0), 2)
                 if frame.shape[:2] != (VIDEO_H, VIDEO_W):
                     frame = cv2.resize(frame, (VIDEO_W, VIDEO_H))
-
                 self.writer.write(frame)
             except Exception:
                 pass
-
-            elapsed = time.perf_counter() - t0
-            sleep_t = max(0.0, interval - elapsed)
-            time.sleep(sleep_t)
+            time.sleep(max(0, interval - (time.perf_counter() - t0)))
 
     def start(self):
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=3.0)
+        time.sleep(0.3)
         self.writer.release()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("Cube Stack Demo  –  SSH headless mode")
-    print(f"  MUJOCO_GL  = {os.environ.get('MUJOCO_GL', 'no seteado')}")
-    print(f"  Escena     = {SCENE_XML}")
-    print(f"  Video out  = {VIDEO_OUTPUT}")
+    print("Cube Stack Demo")
+    print(f"  MUJOCO_GL = {os.environ.get('MUJOCO_GL','no seteado')}")
+    print(f"  Escena    = {SCENE_XML}")
+    print(f"  Video     = {VIDEO_OUT}")
     print("=" * 60)
 
     sim = StretchMujocoSimulator(
@@ -344,41 +339,40 @@ def main():
         camera_hz=10,
     )
 
-    log("Iniciando simulación headless...")
-    sim.start(headless=True)
+    log("Iniciando simulación...")
+    sim.start(headless=HEADLESS)
 
     if not sim.is_running():
-        log("ERROR: La simulación no arrancó.")
+        log("ERROR: la simulación no arrancó.")
         sys.exit(1)
 
-    recorder = VideoRecorder(sim, VIDEO_OUTPUT)
-    recorder.start()
-    log(f"Grabando video en: {VIDEO_OUTPUT}")
+    rec = VideoRecorder(sim, VIDEO_OUT)
+    rec.start()
+    log(f"Grabando en: {VIDEO_OUT}")
 
     try:
-        # Etapa por etapa, actualizar label en el video
-        for phase, label in [
-            ("settle",   "Esperando estabilización"),
-            ("detect",   "Detectando cubos"),
-            ("approach", "Posicionando brazo"),
-            ("grasp",    "Agarrando cubo azul"),
-            ("carry",    "Transportando"),
-            ("place",    "Colocando sobre rojo"),
-            ("done",     "Completado"),
-        ]:
-            recorder.phase_label = label
+        # Esperar que los cubos caigan y se estabilicen
+        rec.label = "Esperando estabilización..."
+        log("Esperando que los cubos se estabilicen...")
+        time.sleep(3.0)
 
-        run_pick_and_place(sim)
-        recorder.phase_label = "Completado"
-        time.sleep(3.0)   # dejar grabar el estado final
+        # Calibrar geometría del brazo
+        rec.label = "Calibrando brazo..."
+        arm_dir, ee_ref, dz_per_lift = probe_arm_geometry(sim)
+
+        # Ejecutar pick-and-place
+        rec.label = "Pick and place..."
+        pick_and_place(sim, arm_dir, ee_ref, dz_per_lift)
+
+        rec.label = "Completado"
+        time.sleep(3.0)
 
     except KeyboardInterrupt:
-        log("Interrumpido por usuario.")
+        log("Interrumpido.")
     finally:
-        recorder.stop()
-        log(f"Video guardado: {VIDEO_OUTPUT}")
+        rec.stop()
+        log(f"Video guardado: {VIDEO_OUT}")
         sim.stop()
-
 
 if __name__ == "__main__":
     main()
