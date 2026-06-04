@@ -34,7 +34,6 @@ VIDEO_W, VIDEO_H = 640, 480
 
 CAMERAS = [
     StretchCameras.cam_d435i_rgb,
-    StretchCameras.cam_d435i_depth,
     StretchCameras.cam_d405_rgb,
     StretchCameras.cam_overhead,
 ]
@@ -135,11 +134,11 @@ def _head_sees_cube(sim, color):
 def sweep_head_for_cube(sim, color):
     """
     Barrido sistemático pan+tilt para encontrar el cubo.
-    Patrón: para cada nivel de tilt (de menos a más abajo), barre pan izq→der.
-    Devuelve True si lo encontró (cabeza ya apuntando hacia él).
+    IMPORTANTE: llamar solo con el brazo retractado (arm=0).
+    Pan limitado a ±0.6 para no sacudir el cuerpo del robot.
     """
     tilt_levels = [-0.5, -0.7, -0.9, -1.1, -1.3]
-    pan_sweep   = [0.0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2]
+    pan_sweep   = [0.0, 0.3, -0.3, 0.6, -0.6]
 
     log(f"  Barrido pan+tilt buscando cubo {color}...")
     for tilt in tilt_levels:
@@ -313,21 +312,18 @@ def detect_cube_3d(sim, color, fallback_xyz):
         log(f"  Servo falló — usando posición de fallback")
         return fallback_xyz.copy()
 
-    # 2. Leer imágenes raw (sin rotar) para backprojection con intrínsecos correctos
+    # 2. Leer imagen RGB raw (sin rotar) para backprojection
     try:
         cam_data = sim.pull_camera_data()
         rgb_raw = cam_data.get_camera_data(
             StretchCameras.cam_d435i_rgb,
             auto_rotate=False, auto_correct_rgb=False)
         bgr_raw = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
-        depth_raw = cam_data.get_camera_data(
-            StretchCameras.cam_d435i_depth,
-            auto_rotate=False, auto_correct_rgb=False)
     except Exception as e:
         log(f"  Error leyendo cámara: {e}")
         return fallback_xyz.copy()
 
-    # Detectar pixel en imagen raw (mismo cubo que centró el servo)
+    # Detectar pixel en imagen raw
     pixel = find_cube_pixel(bgr_raw, color)
     if pixel is None:
         log(f"  Cubo {color} NO detectado en raw — usando fallback")
@@ -336,30 +332,38 @@ def detect_cube_3d(sim, color, fallback_xyz):
     u, v = pixel
     log(f"  Cubo {color} en pixel ({u}, {v}) — imagen {D435I_W}x{D435I_H}")
 
-    # Profundidad en el pixel
-    d_raw = depth_sample(depth_raw, u, v)
-    if d_raw <= 0:
-        log(f"  Sin profundidad válida en ({u},{v}) — usando fallback")
+    # Sin cámara de profundidad: intersectar rayo con plano z=0.52 (mesa+cubo)
+    # Backprojection al plano z_world = TABLE_CUBE_Z
+    TABLE_CUBE_Z = 0.52
+    cam_pose = get_head_cam_pose(sim)
+
+    # Dirección del rayo en frame cámara (normalizada)
+    ray_cam = np.array([(u - D435I_CX) / D435I_FX,
+                        (v - D435I_CY) / D435I_FY,
+                        1.0, 0.0])
+    # Dirección en frame mundo
+    ray_world = (cam_pose @ ray_cam)[:3]
+    origin    = cam_pose[:3, 3]
+
+    # Intersección con plano horizontal z = TABLE_CUBE_Z
+    # origin + t * ray_world = (px, py, TABLE_CUBE_Z)
+    # t = (TABLE_CUBE_Z - origin[2]) / ray_world[2]
+    if abs(ray_world[2]) < 1e-6:
+        log(f"  Rayo paralelo al plano — usando fallback")
         return fallback_xyz.copy()
 
-    depth_m = d_raw * D435I_DEPTH_SCALE
-    log(f"  Profundidad al cubo {color}: {depth_m:.3f} m")
+    t = (TABLE_CUBE_Z - origin[2]) / ray_world[2]
+    if t < 0:
+        log(f"  Intersección detrás de la cámara (t={t:.2f}) — usando fallback")
+        return fallback_xyz.copy()
 
-    # Backprojection: pixel → coordenadas de cámara (frame óptico)
-    x_cam = (u - D435I_CX) / D435I_FX * depth_m
-    y_cam = (v - D435I_CY) / D435I_FY * depth_m
-    z_cam = depth_m
-    p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-    log(f"  Punto en frame cámara: [{x_cam:.3f}, {y_cam:.3f}, {z_cam:.3f}]")
+    p_world = origin + t * ray_world
+    p_world[2] = TABLE_CUBE_Z   # fijar z exacto
+    log(f"  Cubo {color} en frame mundo (ray-plane): {np.round(p_world, 3)}")
 
-    # Transformar a frame mundo
-    cam_pose = get_head_cam_pose(sim)
-    p_world = (cam_pose @ p_cam)[:3]
-    log(f"  Cubo {color} en frame mundo: {np.round(p_world, 3)}")
-
-    # Sanidad: z debe estar entre 0.3 y 0.8 (altura razonable de cubo en mesa)
-    if not (0.3 < p_world[2] < 0.8):
-        log(f"  z={p_world[2]:.3f} fuera de rango — usando fallback")
+    # Sanidad: xy debe estar cerca de la mesa
+    if not (-1.0 < p_world[0] < 1.0 and -1.5 < p_world[1] < 0.0):
+        log(f"  Posición fuera de la mesa — usando fallback")
         return fallback_xyz.copy()
 
     return p_world
@@ -512,60 +516,57 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
         arm  = float(np.clip(np.dot(target_xyz[:2] - ee_ref[:2], adir), 0.0, 0.50))
         return lift, arm
 
-    # ── 1. Mirar la mesa con la cámara de cabeza ──────────────────────────────
-    log("Fase 1: apuntando cámara de cabeza a la mesa...")
-    move(sim, Actuators.head_tilt, -0.85, timeout=5)
-    move(sim, Actuators.head_pan,   0.0,  timeout=5)
-    time.sleep(0.6)
+    # ── 1. DETECCIÓN con brazo retractado (arm=0) ─────────────────────────────
+    # El sweep puede mover la cabeza bastante — hacerlo ANTES de extender el brazo
+    log("Fase 1: brazo retractado, detectando cubos con cabeza D435i...")
+    move(sim, Actuators.arm,  0.0,   timeout=8)   # asegurar brazo adentro
+    move(sim, Actuators.lift, 0.5,   timeout=8)
+    time.sleep(0.5)
 
-    # ── 2. Detectar posición 3D del cubo azul con head camera ─────────────────
-    log("Fase 2: localizando cubo AZUL con cabeza D435i...")
     cube_blue = detect_cube_3d(sim, "blue", CUBE_BLUE_FALLBACK)
-
-    # ── 3. Detectar posición 3D del cubo rojo con head camera ─────────────────
-    log("Fase 3: localizando cubo ROJO con cabeza D435i...")
     cube_red  = detect_cube_3d(sim, "red",  CUBE_RED_FALLBACK)
-
     log(f"  → Azul: {np.round(cube_blue, 3)}")
     log(f"  → Rojo: {np.round(cube_red,  3)}")
 
-    # ── 4. Preparar muñeca ─────────────────────────────────────────────────────
+    # Volver la cabeza al centro después del sweep
+    move(sim, Actuators.head_pan,  0.0,   timeout=3)
+    move(sim, Actuators.head_tilt, -0.6,  timeout=3)
+
+    # ── 2. Preparar muñeca ─────────────────────────────────────────────────────
     move(sim, Actuators.wrist_pitch, -0.9, timeout=5)
     move(sim, Actuators.wrist_yaw,    0.0, timeout=5)
     move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
 
-    # ── 5. Posicionar base frente al cubo azul con head tracking activo ───────
-    log("Fase 4: posicionando base — head tracking cubo azul...")
+    # ── 3. Posicionar base frente al cubo azul ────────────────────────────────
+    # Tracking SOLO durante el movimiento de base (brazo todavía retractado)
+    log("Fase 2: posicionando base frente al cubo azul...")
     stop_track = threading.Event()
-    start_head_tracking(sim, "blue", stop_track)   # cabeza sigue al cubo
+    start_head_tracking(sim, "blue", stop_track)
 
     adir_now = current_arm_dir(sim, arm_dir_cal, theta_cal)
     base_tgt = cube_blue[:2] - adir_now * DESIRED_ARM
     move_base_to(sim, base_tgt[0], base_tgt[1])
+    stop_track.set()   # PARAR tracking antes de cualquier movimiento de brazo
 
-    stop_track.set()   # parar tracking mientras re-detectamos
-    ee_ref, adir_now = refresh_refs()
-
-    # Re-detectar con servo desde nueva posición (más preciso)
-    log("  Re-detectando cubo azul con servo desde nueva posición...")
+    # Re-detectar desde nueva posición (brazo todavía retractado)
+    log("  Re-detectando cubo azul...")
+    move(sim, Actuators.arm, 0.0, timeout=5)   # confirmar brazo adentro
     cube_blue2 = detect_cube_3d(sim, "blue", cube_blue)
     if np.linalg.norm(cube_blue2 - cube_blue) < 0.30:
         cube_blue = cube_blue2
         log(f"  Posición azul refinada: {np.round(cube_blue, 3)}")
+    move(sim, Actuators.head_pan, 0.0, timeout=3)   # centrar cabeza
 
-    # ── 6. Hover sobre cubo azul con cabeza siguiendo ─────────────────────────
-    log("Fase 5: hovering sobre cubo azul...")
-    stop_track = threading.Event()
-    start_head_tracking(sim, "blue", stop_track)   # tracking mientras brazo sube
+    ee_ref, adir_now = refresh_refs()
 
+    # ── 4. Hover sobre cubo azul (sin tracking — brazo en movimiento) ─────────
+    log("Fase 3: hovering sobre cubo azul...")
     lift_h, arm_h = joints_for(cube_blue, ee_ref, adir_now, dz_offset=0.08)
     log(f"  lift={lift_h:.3f}  arm={arm_h:.3f}")
     move(sim, Actuators.lift, lift_h, timeout=8)
     move(sim, Actuators.arm,  arm_h,  timeout=8)
     time.sleep(0.5)
     log(f"  EE real: {np.round(ee_pos(sim), 3)}")
-
-    stop_track.set()
 
     # ── 7. Servo muñeca: ajuste fino con D405 ────────────────────────────────
     log("Fase 6: servo fino con cámara de muñeca D405...")
@@ -703,20 +704,20 @@ class VideoRecorder:
         cv2.putText(head_ann, "Head RGB (D435i)", (4, 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
-        # ── Head Depth colorizado ─────────────────────────────────────────────
-        depth_color = _colorize_depth(depth_raw)
-        if depth_raw is None:
-            try:
-                dr = cam_data.get_camera_data(
-                    StretchCameras.cam_d435i_depth, auto_rotate=False)
-                depth_color = _colorize_depth(dr)
-            except Exception:
-                pass
-        # Marcar pixels detectados también en depth
-        for px, bgr in [(blue_px, (255,80,0)), (red_px, (0,50,255))]:
-            if px:
-                cv2.circle(depth_color, px, 14, bgr, 3)
-        cv2.putText(depth_color, "Head Depth (D435i)", (4, 14),
+        # ── Panel de estado (reemplaza depth que se quitó) ───────────────────
+        depth_color = np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
+        st = self.sim.pull_status()
+        info_lines = [
+            f"lift: {st.lift.pos:.2f}m",
+            f"arm:  {st.arm.pos:.2f}m",
+            f"pan:  {st.head_pan.pos:.2f}r",
+            f"tilt: {st.head_tilt.pos:.2f}r",
+            f"grip: {st.gripper.pos:.3f}",
+        ]
+        for i, line in enumerate(info_lines):
+            cv2.putText(depth_color, line, (8, 28 + i * 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 180), 2)
+        cv2.putText(depth_color, "Estado", (4, 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         # ── Wrist RGB (D405) ──────────────────────────────────────────────────
