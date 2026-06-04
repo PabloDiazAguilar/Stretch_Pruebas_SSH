@@ -123,50 +123,82 @@ HEAD_PAN_LIMITS  = (-4.04, 1.73)
 HEAD_TILT_LIMITS = (-1.53, 0.00)   # 0.00 = horizontal, -1.53 = abajo
 
 
+def _head_sees_cube(sim, color):
+    """Devuelve pixel si la cabeza ve el cubo, None si no."""
+    try:
+        frame = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d435i_rgb)
+        return find_cube_pixel(frame, color)
+    except Exception:
+        return None
+
+
+def sweep_head_for_cube(sim, color):
+    """
+    Barrido sistemático pan+tilt para encontrar el cubo.
+    Patrón: para cada nivel de tilt (de menos a más abajo), barre pan izq→der.
+    Devuelve True si lo encontró (cabeza ya apuntando hacia él).
+    """
+    tilt_levels = [-0.5, -0.7, -0.9, -1.1, -1.3]
+    pan_sweep   = [0.0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2]
+
+    log(f"  Barrido pan+tilt buscando cubo {color}...")
+    for tilt in tilt_levels:
+        sim.move_to(Actuators.head_tilt, tilt)
+        sim.wait_while_is_moving(Actuators.head_tilt, timeout=3)
+        for pan in pan_sweep:
+            sim.move_to(Actuators.head_pan, pan)
+            sim.wait_while_is_moving(Actuators.head_pan, timeout=2)
+            time.sleep(0.15)
+            px = _head_sees_cube(sim, color)
+            if px is not None:
+                log(f"  Cubo {color} encontrado: tilt={tilt:.1f} pan={pan:.1f} px={px}")
+                return True
+    log(f"  Barrido completo: cubo {color} NO encontrado")
+    return False
+
+
 def servo_head_to_cube(sim, color, tolerance=0.08, max_iters=50):
     """
-    Rota pan/tilt de la cabeza hasta centrar el cubo en la imagen.
-    - Si no lo ve, inclina la cabeza más abajo en búsqueda.
-    - Devuelve (True, pixel) si convergió, (False, None) si no.
+    1. Si no lo ve → barrido completo pan+tilt.
+    2. Una vez visible → P-controller hasta centrar.
+    Devuelve (True, pixel) si convergió, (False, None) si no.
     """
     KP = 0.45
     log(f"  Servo cabeza → cubo {color}...")
-    for i in range(max_iters):
+
+    # Búsqueda inicial si no está visible
+    if _head_sees_cube(sim, color) is None:
+        if not sweep_head_for_cube(sim, color):
+            return False, None
+
+    for _ in range(max_iters):
         try:
-            cam_data = sim.pull_camera_data()
-            head_rgb = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
+            frame = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d435i_rgb)
         except Exception:
             time.sleep(0.1)
             continue
 
-        h, w = head_rgb.shape[:2]
-        pixel = find_cube_pixel(head_rgb, color)
+        h, w = frame.shape[:2]
+        pixel = find_cube_pixel(frame, color)
 
         if pixel is None:
-            # Bajar más la cabeza para buscar el cubo
-            st = sim.pull_status()
-            new_tilt = max(st.head_tilt.pos - 0.08, HEAD_TILT_LIMITS[0])
-            sim.move_to(Actuators.head_tilt, new_tilt)
-            time.sleep(0.15)
+            # Perdió de vista: re-buscar
+            if not sweep_head_for_cube(sim, color):
+                return False, None
             continue
 
-        err_u = pixel[0] / w - 0.5   # + = cubo a la derecha
-        err_v = pixel[1] / h - 0.5   # + = cubo abajo del centro
+        err_u = pixel[0] / w - 0.5
+        err_v = pixel[1] / h - 0.5
 
         if abs(err_u) < tolerance and abs(err_v) < tolerance:
-            log(f"  Servo cabeza: {color} centrado en {pixel} "
-                f"(err_u={err_u:.2f} err_v={err_v:.2f})")
+            log(f"  Servo cabeza: {color} centrado {pixel} err=({err_u:.2f},{err_v:.2f})")
             return True, pixel
 
         st = sim.pull_status()
-        # Pan: cubo a la derecha → disminuir pan (en Stretch, pan negativo = derecha)
-        new_pan  = float(np.clip(st.head_pan.pos  - KP * err_u,
-                                 *HEAD_PAN_LIMITS))
-        # Tilt: cubo abajo → bajar más la cabeza (tilt más negativo)
-        new_tilt = float(np.clip(st.head_tilt.pos - KP * err_v,
-                                 *HEAD_TILT_LIMITS))
-        sim.move_to(Actuators.head_pan,  new_pan)
-        sim.move_to(Actuators.head_tilt, new_tilt)
+        sim.move_to(Actuators.head_pan,
+                    float(np.clip(st.head_pan.pos  - KP * err_u, *HEAD_PAN_LIMITS)))
+        sim.move_to(Actuators.head_tilt,
+                    float(np.clip(st.head_tilt.pos - KP * err_v, *HEAD_TILT_LIMITS)))
         time.sleep(0.12)
 
     log(f"  Servo cabeza: no convergió para {color}")
@@ -335,25 +367,65 @@ def detect_cube_3d(sim, color, fallback_xyz):
 # ── Verificación con cámara de muñeca ────────────────────────────────────────
 
 def check_wrist_cam(sim, color):
-    """
-    Lee la cámara de muñeca (D405) y verifica si el cubo está visible.
-    Devuelve pixel central si se detecta, None si no.
-    """
+    """Lee D405 y loguea si ve el cubo. Devuelve pixel o None."""
     try:
-        cam_data = sim.pull_camera_data()
-        wrist_rgb = cam_data.get_camera_data(StretchCameras.cam_d405_rgb)
-        pixel = find_cube_pixel(wrist_rgb, color)
+        wrist_rgb = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d405_rgb)
+        pixel = find_cube_pixel(wrist_rgb, color, skip_top=0.0)
         if pixel:
             h, w = wrist_rgb.shape[:2]
-            norm = (pixel[0] / w - 0.5, pixel[1] / h - 0.5)
-            log(f"  Cámara muñeca: cubo {color} en pixel {pixel}, "
-                f"desviación del centro: ({norm[0]:.2f}, {norm[1]:.2f})")
+            log(f"  Muñeca D405: cubo {color} en {pixel} "
+                f"err=({pixel[0]/w-0.5:.2f}, {pixel[1]/h-0.5:.2f})")
         else:
-            log(f"  Cámara muñeca: cubo {color} NO visible")
+            log(f"  Muñeca D405: cubo {color} NO visible")
         return pixel
     except Exception as e:
         log(f"  Error cámara muñeca: {e}")
         return None
+
+
+def servo_wrist_to_cube(sim, color, max_iters=35, tolerance=0.10):
+    """
+    Servo fino usando la cámara de muñeca D405.
+    Ajusta lift (err vertical) y arm (err horizontal) para centrar el cubo.
+    Con wrist_pitch ≈ -0.9 la cámara mira hacia abajo:
+      - err_u > 0 (cubo a la derecha en imagen) → extender más arm
+      - err_v > 0 (cubo abajo en imagen)        → bajar lift
+    Devuelve True si centrado, False si no visible.
+    """
+    KP_ARM  = 0.02    # m de arm por unidad de error normalizado
+    KP_LIFT = 0.02    # m de lift por unidad de error normalizado
+    log(f"  Servo muñeca D405 → cubo {color}...")
+
+    for _ in range(max_iters):
+        try:
+            wrist_rgb = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d405_rgb)
+        except Exception:
+            time.sleep(0.1)
+            continue
+
+        h, w = wrist_rgb.shape[:2]
+        pixel = find_cube_pixel(wrist_rgb, color, skip_top=0.0)
+
+        if pixel is None:
+            log(f"  Servo muñeca: cubo {color} NO visible")
+            return False
+
+        err_u = pixel[0] / w - 0.5
+        err_v = pixel[1] / h - 0.5
+
+        if abs(err_u) < tolerance and abs(err_v) < tolerance:
+            log(f"  Servo muñeca: {color} centrado {pixel}")
+            return True
+
+        st = sim.pull_status()
+        new_arm  = float(np.clip(st.arm.pos  + KP_ARM  * err_u, 0.0,  0.52))
+        new_lift = float(np.clip(st.lift.pos - KP_LIFT * err_v, 0.05, 1.0))
+        sim.move_to(Actuators.arm,  new_arm)
+        sim.move_to(Actuators.lift, new_lift)
+        time.sleep(0.15)
+
+    log(f"  Servo muñeca: no convergió para {color}")
+    return False
 
 # ── Geometría del brazo ───────────────────────────────────────────────────────
 
@@ -495,14 +567,15 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
 
     stop_track.set()
 
-    # ── 7. Verificar con cámara de muñeca (D405) ──────────────────────────────
-    log("Fase 6: verificando con cámara de muñeca D405...")
-    check_wrist_cam(sim, "blue")
+    # ── 7. Servo muñeca: ajuste fino con D405 ────────────────────────────────
+    log("Fase 6: servo fino con cámara de muñeca D405...")
+    servo_wrist_to_cube(sim, "blue")
 
     # ── 8. Bajar al cubo y agarrar ────────────────────────────────────────────
     log("Fase 7: bajando al cubo azul...")
-    lift_g, arm_g = joints_for(cube_blue, ee_ref, adir_now, dz_offset=-0.01)
-    move(sim, Actuators.lift, lift_g, timeout=6)
+    # Usar posición actual del arm/lift post-servo como referencia
+    st = sim.pull_status()
+    move(sim, Actuators.lift, st.lift.pos - 0.06, timeout=6)
     time.sleep(0.5)
 
     log("Fase 7b: cerrando gripper...")
