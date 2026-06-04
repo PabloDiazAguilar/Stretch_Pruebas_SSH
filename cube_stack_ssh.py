@@ -573,9 +573,10 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
 
     # ── 8. Bajar al cubo y agarrar ────────────────────────────────────────────
     log("Fase 7: bajando al cubo azul...")
-    # Usar posición actual del arm/lift post-servo como referencia
+    # Posición post-servo: bajar desde donde quedó el servo
     st = sim.pull_status()
-    move(sim, Actuators.lift, st.lift.pos - 0.06, timeout=6)
+    lift_at_grasp = st.lift.pos - 0.06
+    move(sim, Actuators.lift, lift_at_grasp, timeout=6)
     time.sleep(0.5)
 
     log("Fase 7b: cerrando gripper...")
@@ -586,7 +587,7 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
 
     # ── 9. Levantar cubo ──────────────────────────────────────────────────────
     log("Fase 8: levantando cubo azul...")
-    lift_carry = float(np.clip(lift_g + 0.20, 0.05, 1.0))
+    lift_carry = float(np.clip(lift_at_grasp + 0.22, 0.05, 1.0))
     move(sim, Actuators.lift, lift_carry, timeout=8)
     time.sleep(0.5)
 
