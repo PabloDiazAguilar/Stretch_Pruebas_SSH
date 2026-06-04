@@ -440,7 +440,48 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
     time.sleep(1.0)
     log("¡Completado!")
 
-# ── Grabación de video (overhead) ────────────────────────────────────────────
+# ── Grabación de video compuesto 2×2 (todas las cámaras) ─────────────────────
+#
+#  ┌──────────────────┬──────────────────┐
+#  │  Head RGB        │  Head Depth      │
+#  │  (detección HSV) │  (colorizado)    │
+#  ├──────────────────┼──────────────────┤
+#  │  Wrist D405      │  Overhead        │
+#  │                  │  (3ra persona)   │
+#  └──────────────────┴──────────────────┘
+
+CELL_W, CELL_H = VIDEO_W // 2, VIDEO_H // 2   # 320 × 240 cada celda
+
+
+def _annotate_head_rgb(frame, blue_px, red_px, depth_blue, depth_red):
+    """Dibuja detecciones sobre el frame de cabeza RGB."""
+    out = frame.copy()
+    for px, color, bgr, depth in [
+        (blue_px, "blue", (255, 80,  0), depth_blue),
+        (red_px,  "red",  (0,  50, 255), depth_red),
+    ]:
+        if px:
+            cv2.circle(out, px, 14, bgr, 3)
+            label = f"{color} {depth:.2f}m" if depth else color
+            cv2.putText(out, label, (px[0] + 8, px[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, bgr, 1)
+    return out
+
+
+def _colorize_depth(depth_raw):
+    """Convierte imagen de profundidad uint16 a BGR colorizado."""
+    if depth_raw is None:
+        return np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
+    norm = cv2.normalize(depth_raw, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    return cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
+
+def _safe_frame(cam_data, camera, fallback_shape):
+    try:
+        return cam_data.get_camera_data(camera).copy()
+    except Exception:
+        return np.zeros(fallback_shape, dtype=np.uint8)
+
 
 class VideoRecorder:
     def __init__(self, sim, path):
@@ -450,30 +491,88 @@ class VideoRecorder:
         self.label = ""
         self._running = False
 
+    def _build_frame(self, cam_data):
+        """Construye el frame compuesto 2×2."""
+
+        # ── Head RGB con overlay de detección ────────────────────────────────
+        head_rgb = _safe_frame(cam_data, StretchCameras.cam_d435i_rgb,
+                               (D435I_H, D435I_W, 3))
+
+        # Detección y profundidad para el overlay
+        blue_px = find_cube_pixel(head_rgb, "blue")
+        red_px  = find_cube_pixel(head_rgb, "red")
+
+        depth_blue = depth_red = None
+        try:
+            depth_raw = cam_data.get_camera_data(
+                StretchCameras.cam_d435i_depth, auto_rotate=False)
+            if blue_px:
+                d = depth_sample(depth_raw, blue_px[0], blue_px[1])
+                depth_blue = d * D435I_DEPTH_SCALE if d > 0 else None
+            if red_px:
+                d = depth_sample(depth_raw, red_px[0], red_px[1])
+                depth_red = d * D435I_DEPTH_SCALE if d > 0 else None
+        except Exception:
+            depth_raw = None
+
+        head_ann = _annotate_head_rgb(head_rgb, blue_px, red_px,
+                                      depth_blue, depth_red)
+        cv2.putText(head_ann, "Head RGB (D435i)", (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+        # ── Head Depth colorizado ─────────────────────────────────────────────
+        depth_color = _colorize_depth(depth_raw)
+        if depth_raw is None:
+            try:
+                dr = cam_data.get_camera_data(
+                    StretchCameras.cam_d435i_depth, auto_rotate=False)
+                depth_color = _colorize_depth(dr)
+            except Exception:
+                pass
+        # Marcar pixels detectados también en depth
+        for px, bgr in [(blue_px, (255,80,0)), (red_px, (0,50,255))]:
+            if px:
+                cv2.circle(depth_color, px, 14, bgr, 3)
+        cv2.putText(depth_color, "Head Depth (D435i)", (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+        # ── Wrist RGB (D405) ──────────────────────────────────────────────────
+        wrist = _safe_frame(cam_data, StretchCameras.cam_d405_rgb, (270, 480, 3))
+        wx = find_cube_pixel(wrist, "blue") or find_cube_pixel(wrist, "red")
+        if wx:
+            cv2.circle(wrist, wx, 14, (0, 255, 0), 3)
+        cv2.putText(wrist, "Wrist RGB (D405)", (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+        # ── Overhead ──────────────────────────────────────────────────────────
+        overhead = _safe_frame(cam_data, StretchCameras.cam_overhead,
+                               (VIDEO_H, VIDEO_W, 3))
+        cv2.putText(overhead, "Overhead", (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+        # ── Ensamblar grilla 2×2 ──────────────────────────────────────────────
+        tl = cv2.resize(head_ann,   (CELL_W, CELL_H))
+        tr = cv2.resize(depth_color,(CELL_W, CELL_H))
+        bl = cv2.resize(wrist,      (CELL_W, CELL_H))
+        br = cv2.resize(overhead,   (CELL_W, CELL_H))
+
+        top = np.hstack([tl, tr])
+        bot = np.hstack([bl, br])
+        grid = np.vstack([top, bot])
+
+        # Label de fase encima
+        if self.label:
+            cv2.putText(grid, self.label, (10, VIDEO_H - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2)
+        return grid
+
     def _loop(self):
         interval = 1.0 / VIDEO_FPS
         while self._running and self.sim.is_running():
             t0 = time.perf_counter()
             try:
-                cam = self.sim.pull_camera_data()
-                frame = cam.get_camera_data(StretchCameras.cam_overhead).copy()
-
-                # Overlay: detección de cubos en frame de cabeza
-                try:
-                    head = cam.get_camera_data(StretchCameras.cam_d435i_rgb)
-                    for color, bgr in [("blue",(255,80,0)), ("red",(0,50,255))]:
-                        px = find_cube_pixel(head, color)
-                        if px:
-                            cv2.circle(frame, px, 12, bgr, 3)
-                except Exception:
-                    pass
-
-                if self.label:
-                    cv2.putText(frame, self.label, (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 0), 2)
-
-                if frame.shape[:2] != (VIDEO_H, VIDEO_W):
-                    frame = cv2.resize(frame, (VIDEO_W, VIDEO_H))
+                cam_data = self.sim.pull_camera_data()
+                frame = self._build_frame(cam_data)
                 self.writer.write(frame)
             except Exception:
                 pass
