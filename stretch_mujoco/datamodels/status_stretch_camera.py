@@ -79,6 +79,7 @@ class StatusStretchCameras:
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
         elif camera == StretchCameras.cam_overhead and self.cam_overhead is not None:
             data = self.cam_overhead
+            data = np.flipud(data)  # MuJoCo renders y-up (OpenGL), flip to y-down (OpenCV)
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
 
         if data is None:

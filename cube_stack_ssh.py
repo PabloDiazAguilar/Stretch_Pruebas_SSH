@@ -63,25 +63,32 @@ def ee_pos(sim):
 
 # ── Calibración automática de geometría del brazo ────────────────────────────
 
+def rotate_2d(v, angle):
+    """Rota vector 2D por angle radianes."""
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+
+
 def probe_arm_geometry(sim):
     """
     Mueve el brazo un poco y mide en qué dirección se mueve el gripper.
-    Devuelve (arm_dir_xy, ee_z_at_lift0, lift_z_ratio).
+    Devuelve (arm_dir_xy, ee_ref, dz_per_lift, theta_calibrated).
+    arm_dir_xy es la dirección del brazo en frame mundo con la theta actual de la base.
     """
     log("Calibrando geometría del brazo...")
 
-    # Llevar a posición de referencia limpia
     move(sim, Actuators.lift, 0.5, timeout=10)
     move(sim, Actuators.arm,  0.0, timeout=10)
     time.sleep(0.5)
 
     ee0 = ee_pos(sim)
-    log(f"  EE en lift=0.5 arm=0: {np.round(ee0, 3)}")
+    theta_cal = sim.pull_status().base.theta
+    log(f"  EE en lift=0.5 arm=0: {np.round(ee0, 3)}  base_theta={theta_cal:.3f}")
 
     # Probar lift: subir 0.1 m
     move(sim, Actuators.lift, 0.6, timeout=6)
     ee_lift = ee_pos(sim)
-    dz_per_lift = (ee_lift[2] - ee0[2]) / 0.1   # ≈ 1.0
+    dz_per_lift = (ee_lift[2] - ee0[2]) / 0.1
     move(sim, Actuators.lift, 0.5, timeout=6)
     log(f"  dz/d_lift ≈ {dz_per_lift:.2f}")
 
@@ -89,17 +96,21 @@ def probe_arm_geometry(sim):
     move(sim, Actuators.arm, ARM_PROBE_DIST, timeout=8)
     time.sleep(0.4)
     ee_arm = ee_pos(sim)
-    d_arm = ee_arm[:2] - ee0[:2]          # delta xy al extender
+    d_arm = ee_arm[:2] - ee0[:2]
     arm_dir = d_arm / (np.linalg.norm(d_arm) + 1e-9)
     move(sim, Actuators.arm, 0.0, timeout=8)
     time.sleep(0.3)
 
     log(f"  Dirección del brazo (xy): {np.round(arm_dir, 3)}")
-    log(f"  EE xy origen: {np.round(ee0[:2], 3)}")
 
-    # z del EE cuando lift=0.5 y arm=0
     ee_ref = ee_pos(sim)
-    return arm_dir, ee_ref, dz_per_lift
+    return arm_dir, ee_ref, dz_per_lift, theta_cal
+
+
+def arm_dir_at_current_theta(sim, arm_dir_cal, theta_cal):
+    """Corrige la dirección del brazo según la rotación actual de la base."""
+    theta_now = sim.pull_status().base.theta
+    return rotate_2d(arm_dir_cal, theta_now - theta_cal)
 
 # ── Control de base ───────────────────────────────────────────────────────────
 
@@ -154,33 +165,17 @@ def find_cube(frame_bgr, color):
 
 # ── Pick and place ────────────────────────────────────────────────────────────
 
-def pick_and_place(sim, arm_dir, ee_ref, dz_per_lift):
+def pick_and_place(sim, arm_dir_cal, ee_ref, dz_per_lift, theta_cal):
     """
     Usa la geometría calibrada para agarrar el cubo azul
     y colocarlo sobre el cubo rojo.
     """
 
-    def compute_joints(target_xyz, arm_ext_margin=0.0):
-        """
-        Dado un target en mundo, calcula lift y arm necesarios.
-        Asume que la base ya está bien posicionada.
-        """
-        # Z: lift necesario para que el EE quede a la altura target
-        dz = target_xyz[2] - ee_ref[2]
-        lift_needed = 0.5 + dz / dz_per_lift
-        lift_needed = float(np.clip(lift_needed, 0.05, 1.0))
-
-        # XY: distancia desde EE_ref hasta target en dirección del brazo
-        d_xy = target_xyz[:2] - ee_ref[:2]
-        arm_needed = float(np.dot(d_xy, arm_dir)) + arm_ext_margin
-        arm_needed = float(np.clip(arm_needed, 0.0, 0.52))
-        return lift_needed, arm_needed
+    desired_arm = 0.35
 
     # ── 1. Posicionar base para cubo azul ────────────────────────────────────
     log("Fase: posicionando base frente al cubo azul...")
-    # La base debe estar en: cube_xy - arm_dir * arm_ext
-    # Dejamos arm_ext ≈ 0.35m para tener algo de margen
-    desired_arm = 0.35
+    arm_dir = arm_dir_at_current_theta(sim, arm_dir_cal, theta_cal)
     base_target = CUBE_BLUE_XYZ[:2] - arm_dir * desired_arm
     move_base_to(sim, base_target[0], base_target[1])
 
@@ -206,11 +201,13 @@ def pick_and_place(sim, arm_dir, ee_ref, dz_per_lift):
     move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
 
     # ── 4. Calcular y mover al cubo azul ─────────────────────────────────────
-    # Recalcular ee_ref con la nueva posición de base
+    # Recalcular ee_ref y arm_dir con la nueva posición y ángulo de base
     move(sim, Actuators.lift, 0.5, timeout=8)
     move(sim, Actuators.arm,  0.0, timeout=8)
     time.sleep(0.3)
     ee_ref_now = ee_pos(sim)
+    arm_dir = arm_dir_at_current_theta(sim, arm_dir_cal, theta_cal)
+    log(f"  arm_dir corregida: {np.round(arm_dir, 3)}")
 
     def compute_joints_now(target_xyz, dz_offset=0.0):
         dz = (target_xyz[2] + dz_offset) - ee_ref_now[2]
@@ -246,7 +243,7 @@ def pick_and_place(sim, arm_dir, ee_ref, dz_per_lift):
     # ── 7. Posicionar sobre cubo rojo ────────────────────────────────────────
     log("Fase: moviéndose al cubo rojo...")
 
-    # Mover base lateralmente si los cubos difieren mucho en x o y
+    arm_dir = arm_dir_at_current_theta(sim, arm_dir_cal, theta_cal)
     base_target_red = CUBE_RED_XYZ[:2] - arm_dir * desired_arm
     move_base_to(sim, base_target_red[0], base_target_red[1])
 
@@ -254,6 +251,8 @@ def pick_and_place(sim, arm_dir, ee_ref, dz_per_lift):
     move(sim, Actuators.arm,  0.0, timeout=6)
     time.sleep(0.3)
     ee_ref_now = ee_pos(sim)
+    arm_dir = arm_dir_at_current_theta(sim, arm_dir_cal, theta_cal)
+    log(f"  arm_dir corregida: {np.round(arm_dir, 3)}")
 
     # Hover sobre cubo rojo (encima del cubo rojo + alto del cubo azul)
     lift_over, arm_red = compute_joints_now(CUBE_RED_XYZ, dz_offset=0.10)
@@ -358,11 +357,11 @@ def main():
 
         # Calibrar geometría del brazo
         rec.label = "Calibrando brazo..."
-        arm_dir, ee_ref, dz_per_lift = probe_arm_geometry(sim)
+        arm_dir, ee_ref, dz_per_lift, theta_cal = probe_arm_geometry(sim)
 
         # Ejecutar pick-and-place
         rec.label = "Pick and place..."
-        pick_and_place(sim, arm_dir, ee_ref, dz_per_lift)
+        pick_and_place(sim, arm_dir, ee_ref, dz_per_lift, theta_cal)
 
         rec.label = "Completado"
         time.sleep(3.0)
