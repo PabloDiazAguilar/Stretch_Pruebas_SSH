@@ -82,15 +82,23 @@ def ee_pos(sim):
 
 # ── Detección de color (HSV) ──────────────────────────────────────────────────
 
-BLUE_LO, BLUE_HI = np.array([100, 100, 50]), np.array([130, 255, 255])
-RED_LO1, RED_HI1 = np.array([  0, 120, 50]), np.array([ 10, 255, 255])
-RED_LO2, RED_HI2 = np.array([170, 120, 50]), np.array([180, 255, 255])
+# S mínimo alto (150) para distinguir azul brillante del cubo vs celeste del cielo
+BLUE_LO, BLUE_HI = np.array([100, 150, 80]),  np.array([130, 255, 255])
+RED_LO1, RED_HI1 = np.array([  0, 140, 80]),  np.array([ 10, 255, 255])
+RED_LO2, RED_HI2 = np.array([170, 140, 80]),  np.array([180, 255, 255])
 
-def find_cube_pixel(frame_bgr, color):
-    """Detecta el cubo por color y devuelve pixel central (u,v) o None."""
+def find_cube_pixel(frame_bgr, color, skip_top=0.35):
+    """
+    Detecta el cubo por color HSV y devuelve pixel central (u,v) en coordenadas
+    del frame completo, o None.
+    skip_top: fracción superior del frame a ignorar (evita cielo/fondo).
+    """
     if frame_bgr is None or frame_bgr.ndim != 3:
         return None
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, w = frame_bgr.shape[:2]
+    roi_y = int(h * skip_top)
+    roi = frame_bgr[roi_y:, :]                    # ignorar parte superior
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     if color == "blue":
         mask = cv2.inRange(hsv, BLUE_LO, BLUE_HI)
     else:
@@ -105,7 +113,98 @@ def find_cube_pixel(frame_bgr, color):
     M = cv2.moments(best)
     if M["m00"] == 0:
         return None
-    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+    # Ajustar coordenada Y de vuelta al frame completo
+    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]) + roi_y)
+
+# ── Servo visual de cabeza ────────────────────────────────────────────────────
+
+# Límites de las articulaciones de la cabeza
+HEAD_PAN_LIMITS  = (-4.04, 1.73)
+HEAD_TILT_LIMITS = (-1.53, 0.00)   # 0.00 = horizontal, -1.53 = abajo
+
+
+def servo_head_to_cube(sim, color, tolerance=0.08, max_iters=50):
+    """
+    Rota pan/tilt de la cabeza hasta centrar el cubo en la imagen.
+    - Si no lo ve, inclina la cabeza más abajo en búsqueda.
+    - Devuelve (True, pixel) si convergió, (False, None) si no.
+    """
+    KP = 0.45
+    log(f"  Servo cabeza → cubo {color}...")
+    for i in range(max_iters):
+        try:
+            cam_data = sim.pull_camera_data()
+            head_rgb = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
+        except Exception:
+            time.sleep(0.1)
+            continue
+
+        h, w = head_rgb.shape[:2]
+        pixel = find_cube_pixel(head_rgb, color)
+
+        if pixel is None:
+            # Bajar más la cabeza para buscar el cubo
+            st = sim.pull_status()
+            new_tilt = max(st.head_tilt.pos - 0.08, HEAD_TILT_LIMITS[0])
+            sim.move_to(Actuators.head_tilt, new_tilt)
+            time.sleep(0.15)
+            continue
+
+        err_u = pixel[0] / w - 0.5   # + = cubo a la derecha
+        err_v = pixel[1] / h - 0.5   # + = cubo abajo del centro
+
+        if abs(err_u) < tolerance and abs(err_v) < tolerance:
+            log(f"  Servo cabeza: {color} centrado en {pixel} "
+                f"(err_u={err_u:.2f} err_v={err_v:.2f})")
+            return True, pixel
+
+        st = sim.pull_status()
+        # Pan: cubo a la derecha → disminuir pan (en Stretch, pan negativo = derecha)
+        new_pan  = float(np.clip(st.head_pan.pos  - KP * err_u,
+                                 *HEAD_PAN_LIMITS))
+        # Tilt: cubo abajo → bajar más la cabeza (tilt más negativo)
+        new_tilt = float(np.clip(st.head_tilt.pos - KP * err_v,
+                                 *HEAD_TILT_LIMITS))
+        sim.move_to(Actuators.head_pan,  new_pan)
+        sim.move_to(Actuators.head_tilt, new_tilt)
+        time.sleep(0.12)
+
+    log(f"  Servo cabeza: no convergió para {color}")
+    return False, None
+
+
+def start_head_tracking(sim, color, stop_event):
+    """
+    Hilo de fondo: mantiene la cabeza apuntando al cubo mientras el brazo se mueve.
+    stop_event.set() para detenerlo.
+    """
+    KP = 0.3
+
+    def _track():
+        while not stop_event.is_set():
+            try:
+                cam_data = sim.pull_camera_data()
+                head_rgb = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
+                h, w = head_rgb.shape[:2]
+                pixel = find_cube_pixel(head_rgb, color)
+                if pixel:
+                    err_u = pixel[0] / w - 0.5
+                    err_v = pixel[1] / h - 0.5
+                    st = sim.pull_status()
+                    sim.move_to(Actuators.head_pan,
+                                float(np.clip(st.head_pan.pos  - KP * err_u,
+                                              *HEAD_PAN_LIMITS)))
+                    sim.move_to(Actuators.head_tilt,
+                                float(np.clip(st.head_tilt.pos - KP * err_v,
+                                              *HEAD_TILT_LIMITS)))
+            except Exception:
+                pass
+            time.sleep(0.12)
+
+    t = threading.Thread(target=_track, daemon=True)
+    t.start()
+    return t
+
 
 # ── Localización 3D con cámara de cabeza ──────────────────────────────────────
 
@@ -175,28 +274,31 @@ def detect_cube_3d(sim, color, fallback_xyz):
       5. Transforma a frame mundo con la pose de la cámara
     """
     log(f"  Detectando cubo {color} con cámara de cabeza...")
+
+    # 1. Servo: centrar cubo en la imagen antes de medir
+    servo_ok, _ = servo_head_to_cube(sim, color)
+    if not servo_ok:
+        log(f"  Servo falló — usando posición de fallback")
+        return fallback_xyz.copy()
+
+    # 2. Leer imágenes raw (sin rotar) para backprojection con intrínsecos correctos
     try:
         cam_data = sim.pull_camera_data()
-
-        # Imagen RGB sin rotar (raw), convertir de RGB a BGR para OpenCV
         rgb_raw = cam_data.get_camera_data(
             StretchCameras.cam_d435i_rgb,
             auto_rotate=False, auto_correct_rgb=False)
         bgr_raw = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
-
-        # Imagen de profundidad sin rotar
         depth_raw = cam_data.get_camera_data(
             StretchCameras.cam_d435i_depth,
             auto_rotate=False, auto_correct_rgb=False)
-
     except Exception as e:
         log(f"  Error leyendo cámara: {e}")
         return fallback_xyz.copy()
 
-    # Detectar pixel del cubo
+    # Detectar pixel en imagen raw (mismo cubo que centró el servo)
     pixel = find_cube_pixel(bgr_raw, color)
     if pixel is None:
-        log(f"  Cubo {color} NO detectado — usando posición de fallback")
+        log(f"  Cubo {color} NO detectado en raw — usando fallback")
         return fallback_xyz.copy()
 
     u, v = pixel
@@ -360,24 +462,30 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
     move(sim, Actuators.wrist_yaw,    0.0, timeout=5)
     move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
 
-    # ── 5. Posicionar base frente al cubo azul ────────────────────────────────
-    log("Fase 4: posicionando base frente al cubo azul...")
+    # ── 5. Posicionar base frente al cubo azul con head tracking activo ───────
+    log("Fase 4: posicionando base — head tracking cubo azul...")
+    stop_track = threading.Event()
+    start_head_tracking(sim, "blue", stop_track)   # cabeza sigue al cubo
+
     adir_now = current_arm_dir(sim, arm_dir_cal, theta_cal)
     base_tgt = cube_blue[:2] - adir_now * DESIRED_ARM
     move_base_to(sim, base_tgt[0], base_tgt[1])
+
+    stop_track.set()   # parar tracking mientras re-detectamos
     ee_ref, adir_now = refresh_refs()
 
-    # Re-detectar con cámara desde nueva posición
-    log("  Re-detectando cubo azul desde nueva posición...")
-    move(sim, Actuators.head_tilt, -0.85, timeout=4)
-    time.sleep(0.4)
+    # Re-detectar con servo desde nueva posición (más preciso)
+    log("  Re-detectando cubo azul con servo desde nueva posición...")
     cube_blue2 = detect_cube_3d(sim, "blue", cube_blue)
     if np.linalg.norm(cube_blue2 - cube_blue) < 0.30:
-        cube_blue = cube_blue2   # actualizar solo si parece razonable
+        cube_blue = cube_blue2
         log(f"  Posición azul refinada: {np.round(cube_blue, 3)}")
 
-    # ── 6. Hover sobre cubo azul ──────────────────────────────────────────────
+    # ── 6. Hover sobre cubo azul con cabeza siguiendo ─────────────────────────
     log("Fase 5: hovering sobre cubo azul...")
+    stop_track = threading.Event()
+    start_head_tracking(sim, "blue", stop_track)   # tracking mientras brazo sube
+
     lift_h, arm_h = joints_for(cube_blue, ee_ref, adir_now, dz_offset=0.08)
     log(f"  lift={lift_h:.3f}  arm={arm_h:.3f}")
     move(sim, Actuators.lift, lift_h, timeout=8)
@@ -385,9 +493,11 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
     time.sleep(0.5)
     log(f"  EE real: {np.round(ee_pos(sim), 3)}")
 
+    stop_track.set()
+
     # ── 7. Verificar con cámara de muñeca (D405) ──────────────────────────────
     log("Fase 6: verificando con cámara de muñeca D405...")
-    wrist_px = check_wrist_cam(sim, "blue")
+    check_wrist_cam(sim, "blue")
 
     # ── 8. Bajar al cubo y agarrar ────────────────────────────────────────────
     log("Fase 7: bajando al cubo azul...")
@@ -399,7 +509,6 @@ def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
     move(sim, Actuators.gripper, GRIPPER_CLOSE, timeout=4)
     time.sleep(0.6)
 
-    # Verificar agarre con muñeca
     check_wrist_cam(sim, "blue")
 
     # ── 9. Levantar cubo ──────────────────────────────────────────────────────
