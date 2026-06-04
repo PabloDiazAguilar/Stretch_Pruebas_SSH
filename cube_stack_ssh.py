@@ -1,9 +1,14 @@
 """
-Cube stacking demo — vision-based using all cameras.
+Cube stacking demo — vision-based con ArUco del brazo.
 
-Head camera (D435i RGB+Depth): localiza cubos en 3D
-Wrist camera (D405 RGB):       confirma posición antes de agarrar
-Overhead camera:                graba video en tercera persona
+Flujo:
+  1. point_head_at(posición estimada) → cabeza mira al brazo
+  2. Detecta ArUco de muñeca (ID=133, DICT_6X6_250) → posición exacta
+     del gripper en frame cámara
+  3. Detecta cubo azul (HSV) en el mismo frame
+  4. Delta gripper→cubo en frame cámara → corrección de arm/lift
+  5. Wrist servo (D405) para alineación final
+  6. Bajar, cerrar, levantar, colocar sobre rojo
 
 Usage:
     MUJOCO_GL=glfw  python cube_stack_ssh.py   # con ventana
@@ -39,709 +44,536 @@ CAMERAS = [
     StretchCameras.cam_overhead,
 ]
 
-# Intrínsecos de la cámara de cabeza D435i (imagen sin rotar, raw)
-# Extraídos de sim.py / initial_camera_settings
-D435I_FX   = 303.07
-D435I_FY   = 303.06
-D435I_CX   = 122.79
-D435I_CY   = 210.94
-D435I_W    = 424
-D435I_H    = 240
-D435I_DEPTH_SCALE = 1e-3    # metros por unidad de profundidad
+# ── Intrínsecos D435i (raw, sin rotar: 424×240) ───────────────────────────────
+D435I_FX, D435I_FY = 303.07, 303.06
+D435I_CX, D435I_CY = 122.79, 210.94
+D435I_W,  D435I_H  = 424, 240
+D435I_DEPTH_SCALE  = 1e-3
+D435I_K = np.array([[D435I_FX, 0, D435I_CX],
+                     [0, D435I_FY, D435I_CY],
+                     [0, 0,        1       ]], dtype=np.float32)
+D435I_DIST = np.zeros(5, dtype=np.float32)
 
-# Fallback si la detección visual falla (posiciones del XML)
-CUBE_BLUE_FALLBACK = np.array([-0.04, -0.55, 0.52])
-CUBE_RED_FALLBACK  = np.array([ 0.12, -0.55, 0.52])
+# ── ArUco del brazo (ya en el modelo) ────────────────────────────────────────
+# arm_top_wrist_aruco_sticker.png → DICT_6X6_250 ID=133
+# right_finger_aruco.png          → DICT_6X6_250 ID=201
+# left_finger_aruco.png           → DICT_6X6_250 ID=200
+ARUCO_DICT_ID    = cv2.aruco.DICT_6X6_250
+ARUCO_WRIST_ID   = 133    # muñeca superior (más visible desde arriba)
+ARUCO_MARKER_M   = 0.04   # tamaño físico del sticker ≈ 4 cm
+_aruco_dict      = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
+_aruco_params    = cv2.aruco.DetectorParameters()
+_aruco_detector  = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
 
-# Gripper
+# Posiciones fallback de los cubos (del XML, tras caer en la mesa)
+CUBE_BLUE_FB = np.array([-0.04, -0.55, 0.52])
+CUBE_RED_FB  = np.array([ 0.12, -0.55, 0.52])
+
 GRIPPER_OPEN  =  0.04
 GRIPPER_CLOSE = -0.015
-ARM_PROBE_DIST = 0.12
+ARM_PROBE_M   = 0.12
 
-# Nombres candidatos para get_link_pose de la cámara de cabeza
-HEAD_CAM_LINKS = [
-    "camera_color_optical_frame",
-    "camera_color_frame",
-    "camera_link",
-    "link_head_tilt",
-]
+HEAD_PAN_LIM  = (-4.04,  1.73)
+HEAD_TILT_LIM = (-1.53,  0.00)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ── Actuadores ────────────────────────────────────────────────────────────────
+def move(sim, act, pos, timeout=8.0):
+    sim.move_to(act, pos)
+    sim.wait_while_is_moving(act, timeout=timeout)
 
-def move(sim, actuator, pos, timeout=8.0):
-    sim.move_to(actuator, pos)
-    sim.wait_while_is_moving(actuator, timeout=timeout)
+def ee_pos(sim): return sim.get_ee_pose()[:3, 3].copy()
 
-def ee_pos(sim):
-    return sim.get_ee_pose()[:3, 3].copy()
-
-# ── Detección de color (HSV) ──────────────────────────────────────────────────
-
-# S mínimo alto (150) para distinguir azul brillante del cubo vs celeste del cielo
-BLUE_LO, BLUE_HI = np.array([100, 150, 80]),  np.array([130, 255, 255])
-RED_LO1, RED_HI1 = np.array([  0, 140, 80]),  np.array([ 10, 255, 255])
-RED_LO2, RED_HI2 = np.array([170, 140, 80]),  np.array([180, 255, 255])
-
-def find_cube_pixel(frame_bgr, color, skip_top=0.35):
-    """
-    Detecta el cubo por color HSV y devuelve pixel central (u,v) en coordenadas
-    del frame completo, o None.
-    skip_top: fracción superior del frame a ignorar (evita cielo/fondo).
-    """
-    if frame_bgr is None or frame_bgr.ndim != 3:
-        return None
-    h, w = frame_bgr.shape[:2]
-    roi_y = int(h * skip_top)
-    roi = frame_bgr[roi_y:, :]                    # ignorar parte superior
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    if color == "blue":
-        mask = cv2.inRange(hsv, BLUE_LO, BLUE_HI)
-    else:
-        mask = cv2.bitwise_or(cv2.inRange(hsv, RED_LO1, RED_HI1),
-                              cv2.inRange(hsv, RED_LO2, RED_HI2))
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    best = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(best) < 100:
-        return None
-    M = cv2.moments(best)
-    if M["m00"] == 0:
-        return None
-    # Ajustar coordenada Y de vuelta al frame completo
-    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]) + roi_y)
-
-# ── Servo visual de cabeza ────────────────────────────────────────────────────
-
-# Límites de las articulaciones de la cabeza
-HEAD_PAN_LIMITS  = (-4.04, 1.73)
-HEAD_TILT_LIMITS = (-1.53, 0.00)   # 0.00 = horizontal, -1.53 = abajo
-
-
+# ── Cabeza: apuntar a un punto ────────────────────────────────────────────────
 def point_head_at(sim, target_xyz):
-    """
-    Calcula directamente los ángulos pan y tilt necesarios para que
-    la cabeza apunte al punto target_xyz en frame mundo.
-    No hace sweep — va directo al ángulo correcto.
-    """
-    st = sim.pull_status()
+    """Calcula y comanda pan+tilt para mirar directamente a target_xyz."""
+    st    = sim.pull_status()
     theta = st.base.theta
-
-    # Posición aproximada de la cabeza en frame mundo
-    # (base + offset del mástil ≈ 0.1m hacia atrás, altura ≈ lift + 0.2m)
-    head_pos = np.array([
-        st.base.x - 0.1 * np.cos(theta),
-        st.base.y - 0.1 * np.sin(theta),
-        st.lift.pos + 0.20
-    ])
-
-    v = target_xyz - head_pos                       # vector cabeza → target
-    fwd = np.array([ np.cos(theta),  np.sin(theta)])
-    lft = np.array([-np.sin(theta),  np.cos(theta)])
-
-    v_fwd  = float(v[0]*fwd[0] + v[1]*fwd[1])      # componente adelante
-    v_lft  = float(v[0]*lft[0] + v[1]*lft[1])      # componente izquierda
-    v_up   = float(v[2])                            # componente arriba (negativo = abajo)
-
-    pan  = float(np.clip(np.arctan2(v_lft, v_fwd),
-                         *HEAD_PAN_LIMITS))
-    tilt = float(np.clip(np.arctan2(v_up, np.hypot(v_fwd, v_lft)),
-                         *HEAD_TILT_LIMITS))
-
-    log(f"  Apuntando cabeza a {np.round(target_xyz,2)}: pan={pan:.2f} tilt={tilt:.2f}")
+    head  = np.array([st.base.x - 0.1*np.cos(theta),
+                      st.base.y - 0.1*np.sin(theta),
+                      st.lift.pos + 0.20])
+    v    = target_xyz - head
+    fwd  = np.array([ np.cos(theta),  np.sin(theta)])
+    lft  = np.array([-np.sin(theta),  np.cos(theta)])
+    vf   = v[0]*fwd[0] + v[1]*fwd[1]
+    vl   = v[0]*lft[0] + v[1]*lft[1]
+    pan  = float(np.clip(np.arctan2(vl, vf),        *HEAD_PAN_LIM))
+    tilt = float(np.clip(np.arctan2(v[2], np.hypot(vf, vl)), *HEAD_TILT_LIM))
+    log(f"  → cabeza pan={pan:.2f} tilt={tilt:.2f}")
     sim.move_to(Actuators.head_pan,  pan)
     sim.move_to(Actuators.head_tilt, tilt)
     sim.wait_while_is_moving(Actuators.head_pan,  timeout=4)
     sim.wait_while_is_moving(Actuators.head_tilt, timeout=4)
     time.sleep(0.25)
 
+# ── Cámara: leer frames raw ───────────────────────────────────────────────────
+def get_head_frames(sim):
+    """Devuelve (bgr_raw, depth_raw) de la cámara de cabeza sin rotar."""
+    cam = sim.pull_camera_data()
+    rgb = cam.get_camera_data(StretchCameras.cam_d435i_rgb,
+                              auto_rotate=False, auto_correct_rgb=False)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    try:
+        dep = cam.get_camera_data(StretchCameras.cam_d435i_depth,
+                                  auto_rotate=False, auto_correct_rgb=False)
+    except Exception:
+        dep = None
+    return bgr, dep
 
-def servo_head_to_cube(sim, color, tolerance=0.06, max_iters=20):
-    """
-    Corrección fina con P-controller DESPUÉS de point_head_at.
-    Ya debería estar cerca — converge rápido sin sweep.
-    """
-    KP = 0.35
-    for _ in range(max_iters):
-        try:
-            frame = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d435i_rgb)
-        except Exception:
-            time.sleep(0.1)
-            continue
+# ── Backprojection pixel→3D en frame cámara ───────────────────────────────────
+def backproject(u, v, depth_m):
+    x = (u - D435I_CX) / D435I_FX * depth_m
+    y = (v - D435I_CY) / D435I_FY * depth_m
+    return np.array([x, y, depth_m])
 
-        h, w = frame.shape[:2]
-        pixel = find_cube_pixel(frame, color)
-        if pixel is None:
-            return False, None
-
-        err_u = pixel[0] / w - 0.5
-        err_v = pixel[1] / h - 0.5
-        if abs(err_u) < tolerance and abs(err_v) < tolerance:
-            log(f"  Servo cabeza: {color} centrado {pixel}")
-            return True, pixel
-
-        st = sim.pull_status()
-        sim.move_to(Actuators.head_pan,
-                    float(np.clip(st.head_pan.pos  - KP * err_u, *HEAD_PAN_LIMITS)))
-        sim.move_to(Actuators.head_tilt,
-                    float(np.clip(st.head_tilt.pos - KP * err_v, *HEAD_TILT_LIMITS)))
-        time.sleep(0.12)
-
-    log(f"  Servo cabeza: no convergió para {color}")
-    return False, None
-
-
-def start_head_tracking(sim, color, stop_event):
-    """
-    Hilo de fondo: mantiene la cabeza apuntando al cubo mientras el brazo se mueve.
-    stop_event.set() para detenerlo.
-    """
-    KP = 0.3
-
-    def _track():
-        while not stop_event.is_set():
-            try:
-                cam_data = sim.pull_camera_data()
-                head_rgb = cam_data.get_camera_data(StretchCameras.cam_d435i_rgb)
-                h, w = head_rgb.shape[:2]
-                pixel = find_cube_pixel(head_rgb, color)
-                if pixel:
-                    err_u = pixel[0] / w - 0.5
-                    err_v = pixel[1] / h - 0.5
-                    st = sim.pull_status()
-                    sim.move_to(Actuators.head_pan,
-                                float(np.clip(st.head_pan.pos  - KP * err_u,
-                                              *HEAD_PAN_LIMITS)))
-                    sim.move_to(Actuators.head_tilt,
-                                float(np.clip(st.head_tilt.pos - KP * err_v,
-                                              *HEAD_TILT_LIMITS)))
-            except Exception:
-                pass
-            time.sleep(0.12)
-
-    t = threading.Thread(target=_track, daemon=True)
-    t.start()
-    return t
-
-
-# ── Localización 3D con cámara de cabeza ──────────────────────────────────────
-
-def get_head_cam_pose(sim):
-    """Obtiene la pose de la cámara de cabeza en frame mundo."""
-    for name in HEAD_CAM_LINKS:
-        try:
-            pose = sim.get_link_pose(name)
-            log(f"  Pose de cámara obtenida con link: '{name}'")
-            return pose
-        except Exception:
-            continue
-    log("  WARN: no se pudo obtener pose de cámara, usando posición del EE como proxy")
-    # Proxy: la cámara está aproximadamente donde está el EE pero en la cabeza
-    # Construir pose aproximada desde el estado del robot
-    st = sim.pull_status()
-    theta = st.base.theta
-    bx, by = st.base.x, st.base.y
-    # Altura aproximada de la cámara (lift + offset fijo ≈ 0.15m por encima del lift)
-    cam_z = st.lift.pos + 0.15
-    # Rotación de la cabeza: base_theta + head_pan, y head_tilt
-    pan  = st.head_pan.pos
-    tilt = st.head_tilt.pos
-    heading = theta + pan
-    # Pose simple (sin FK completo, aproximada)
-    pose = np.eye(4)
-    pose[0, 3] = bx
-    pose[1, 3] = by
-    pose[2, 3] = cam_z
-    # Dirección de mirada: heading en xy, tilt en z
-    cx_ = np.cos(heading) * np.cos(tilt)
-    cy_ = np.sin(heading) * np.cos(tilt)
-    cz_ = -np.sin(tilt)
-    z_ax = np.array([cx_, cy_, cz_])
-    x_ax = np.array([-np.sin(heading), np.cos(heading), 0])
-    y_ax = np.cross(z_ax, x_ax)
-    pose[:3, 0] = x_ax
-    pose[:3, 1] = y_ax
-    pose[:3, 2] = z_ax
-    return pose
-
-
-def depth_sample(depth_img, u, v, radius=4):
-    """Muestra mediana de profundidad alrededor del pixel (u,v)."""
-    h, w = depth_img.shape[:2]
-    vals = []
-    for dv in range(-radius, radius + 1):
-        for du in range(-radius, radius + 1):
-            py, px = v + dv, u + du
-            if 0 <= py < h and 0 <= px < w:
-                d = depth_img[py, px]
-                if d > 0:
-                    vals.append(d)
+def depth_sample(depth_raw, u, v, r=4):
+    if depth_raw is None: return 0.0
+    h, w = depth_raw.shape[:2]
+    vals = [depth_raw[py, px]
+            for dv in range(-r, r+1) for du in range(-r, r+1)
+            if 0 <= (py:=v+dv) < h and 0 <= (px:=u+du) < w and depth_raw[py,px] > 0]
     return float(np.median(vals)) if vals else 0.0
 
+# ── Pose de la cámara en frame mundo (para transformar deltas) ────────────────
+def get_head_cam_R(sim):
+    """Matriz de rotación cámara→mundo (aproximada desde articulaciones)."""
+    st    = sim.pull_status()
+    theta = st.base.theta
+    pan   = st.head_pan.pos
+    tilt  = st.head_tilt.pos
+    heading = theta + pan
+    # Ejes de la cámara en mundo
+    z_cam = np.array([np.cos(heading)*np.cos(tilt),
+                      np.sin(heading)*np.cos(tilt),
+                     -np.sin(tilt)])
+    x_cam = np.array([-np.sin(heading), np.cos(heading), 0.0])
+    y_cam = np.cross(z_cam, x_cam)
+    return np.column_stack([x_cam, y_cam, z_cam])   # R_world_from_cam
 
-def detect_cube_3d(sim, color, fallback_xyz):
+# ── Detección de color (HSV) ──────────────────────────────────────────────────
+BLUE_LO, BLUE_HI = np.array([100,150,80]),  np.array([130,255,255])
+RED_LO1, RED_HI1 = np.array([0,  140,80]),  np.array([ 10,255,255])
+RED_LO2, RED_HI2 = np.array([170,140,80]),  np.array([180,255,255])
+
+def find_cube_pixel(bgr, color, skip_top=0.30):
+    if bgr is None or bgr.ndim != 3: return None
+    h, w = bgr.shape[:2]
+    y0   = int(h * skip_top)
+    hsv  = cv2.cvtColor(bgr[y0:], cv2.COLOR_BGR2HSV)
+    mask = (cv2.inRange(hsv, BLUE_LO, BLUE_HI) if color == "blue"
+            else cv2.bitwise_or(cv2.inRange(hsv, RED_LO1, RED_HI1),
+                                cv2.inRange(hsv, RED_LO2, RED_HI2)))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return None
+    best = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(best) < 100: return None
+    M = cv2.moments(best)
+    if M["m00"] == 0: return None
+    return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]) + y0)
+
+# ── Detección ArUco del brazo ─────────────────────────────────────────────────
+def detect_wrist_aruco(bgr):
     """
-    Usa la cámara de cabeza (D435i RGB + depth) para detectar un cubo por color
-    y calcular su posición 3D en frame mundo.
-
-    Pasos:
-      1. Lee imagen RGB raw (sin rotar) y depth raw
-      2. Detecta el cubo por HSV en la imagen BGR
-      3. Muestrea profundidad en el pixel detectado
-      4. Convierte pixel+depth a coordenadas de cámara (backprojection)
-      5. Transforma a frame mundo con la pose de la cámara
+    Detecta el ArUco de muñeca (ID=133, DICT_6X6_250).
+    Devuelve (pixel_centro, corners_4x2) o (None, None).
     """
-    log(f"  Detectando cubo {color}...")
+    corners, ids, _ = _aruco_detector.detectMarkers(bgr)
+    if ids is None: return None, None
+    flat = ids.flatten()
+    if ARUCO_WRIST_ID not in flat: return None, None
+    idx  = np.where(flat == ARUCO_WRIST_ID)[0][0]
+    pts  = corners[idx].reshape(4, 2)
+    cx   = int(pts[:, 0].mean())
+    cy   = int(pts[:, 1].mean())
+    return (cx, cy), pts
 
-    # 1. Apuntar cabeza directamente al target (sin sweep)
-    point_head_at(sim, fallback_xyz)
-
-    # 2. Corrección fina con servo
-    servo_head_to_cube(sim, color)
-
-    # 3. Leer imagen raw para backprojection consistente con los intrínsecos
-    try:
-        cam_data = sim.pull_camera_data()
-        rgb_raw = cam_data.get_camera_data(
-            StretchCameras.cam_d435i_rgb, auto_rotate=False, auto_correct_rgb=False)
-        bgr_raw  = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
-        depth_raw = cam_data.get_camera_data(
-            StretchCameras.cam_d435i_depth, auto_rotate=False, auto_correct_rgb=False)
-    except Exception as e:
-        log(f"  Error leyendo cámara: {e}")
-        return fallback_xyz.copy()
-
-    pixel = find_cube_pixel(bgr_raw, color)
-    if pixel is None:
-        log(f"  Cubo {color} NO detectado — usando fallback")
-        return fallback_xyz.copy()
-
-    u, v = pixel
-    log(f"  Cubo {color} pixel ({u},{v})")
-
-    # 4. Profundidad en el pixel detectado
-    d_raw = depth_sample(depth_raw, u, v)
-    cam_pose = get_head_cam_pose(sim)
-
-    if d_raw > 0:
-        # Backprojection con profundidad real
-        depth_m = d_raw * D435I_DEPTH_SCALE
-        x_c = (u - D435I_CX) / D435I_FX * depth_m
-        y_c = (v - D435I_CY) / D435I_FY * depth_m
-        p_world = (cam_pose @ np.array([x_c, y_c, depth_m, 1.0]))[:3]
-        log(f"  Cubo {color} (depth {depth_m:.2f}m): {np.round(p_world, 3)}")
-    else:
-        # Sin depth → intersección rayo-plano z=0.52
-        TABLE_Z = 0.52
-        ray_w = (cam_pose @ np.array([(u-D435I_CX)/D435I_FX,
-                                       (v-D435I_CY)/D435I_FY, 1.0, 0.0]))[:3]
-        orig  = cam_pose[:3, 3]
-        if abs(ray_w[2]) < 1e-6:
-            return fallback_xyz.copy()
-        t = (TABLE_Z - orig[2]) / ray_w[2]
-        if t < 0:
-            return fallback_xyz.copy()
-        p_world = orig + t * ray_w
-        p_world[2] = TABLE_Z
-        log(f"  Cubo {color} (ray-plane): {np.round(p_world, 3)}")
-
-    # Sanidad
-    if not (-1.0 < p_world[0] < 1.0 and -1.5 < p_world[1] < 0.0
-            and  0.3 < p_world[2] < 0.8):
-        log(f"  Fuera de rango — usando fallback")
-        return fallback_xyz.copy()
-
-    return p_world
-
-# ── Verificación con cámara de muñeca ────────────────────────────────────────
-
-def check_wrist_cam(sim, color):
-    """Lee D405 y loguea si ve el cubo. Devuelve pixel o None."""
-    try:
-        wrist_rgb = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d405_rgb)
-        pixel = find_cube_pixel(wrist_rgb, color, skip_top=0.0)
-        if pixel:
-            h, w = wrist_rgb.shape[:2]
-            log(f"  Muñeca D405: cubo {color} en {pixel} "
-                f"err=({pixel[0]/w-0.5:.2f}, {pixel[1]/h-0.5:.2f})")
-        else:
-            log(f"  Muñeca D405: cubo {color} NO visible")
-        return pixel
-    except Exception as e:
-        log(f"  Error cámara muñeca: {e}")
-        return None
-
-
-def servo_wrist_to_cube(sim, color, max_iters=35, tolerance=0.10):
+# ── Alineación principal: ArUco muñeca + detección cubo ──────────────────────
+def aruco_align_to_cube(sim, color, arm_dir, max_iters=8, tol_px=20):
     """
-    Servo fino usando la cámara de muñeca D405.
-    Ajusta lift (err vertical) y arm (err horizontal) para centrar el cubo.
-    Con wrist_pitch ≈ -0.9 la cámara mira hacia abajo:
-      - err_u > 0 (cubo a la derecha en imagen) → extender más arm
-      - err_v > 0 (cubo abajo en imagen)        → bajar lift
-    Devuelve True si centrado, False si no visible.
-    """
-    KP_ARM  = 0.02    # m de arm por unidad de error normalizado
-    KP_LIFT = 0.02    # m de lift por unidad de error normalizado
-    log(f"  Servo muñeca D405 → cubo {color}...")
+    Alineación óptica usando ArUco de muñeca como referencia del gripper.
 
-    for _ in range(max_iters):
-        try:
-            wrist_rgb = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d405_rgb)
-        except Exception:
-            time.sleep(0.1)
+    Con wrist_pitch≈-0.3 (muñeca casi horizontal) el ArUco superior
+    es visible desde la cámara de cabeza mirando hacia abajo.
+
+    En cada iteración:
+      - Detecta ArUco muñeca → posición gripper en frame cámara
+      - Detecta cubo azul   → posición cubo en frame cámara
+      - Calcula delta en frame cámara → convierte a mundo → ajusta arm/lift
+    """
+    log("  Alineación ArUco+visión...")
+
+    # Wrist en ángulo intermedio para que el ArUco superior sea visible
+    move(sim, Actuators.wrist_pitch, -0.3, timeout=4)
+    time.sleep(0.3)
+
+    for it in range(max_iters):
+        # Apuntar cabeza al EE actual
+        point_head_at(sim, ee_pos(sim))
+        time.sleep(0.2)
+
+        bgr, dep = get_head_frames(sim)
+
+        # ── Detectar ArUco de muñeca ──────────────────────────────────────
+        aruco_px, _ = detect_wrist_aruco(bgr)
+        if aruco_px is None:
+            log(f"  iter {it}: ArUco muñeca NO visto — ajustando tilt")
+            st = sim.pull_status()
+            sim.move_to(Actuators.head_tilt,
+                        float(np.clip(st.head_tilt.pos - 0.05, *HEAD_TILT_LIM)))
+            time.sleep(0.3)
             continue
 
-        h, w = wrist_rgb.shape[:2]
-        pixel = find_cube_pixel(wrist_rgb, color, skip_top=0.0)
+        # ── Detectar cubo ─────────────────────────────────────────────────
+        cube_px = find_cube_pixel(bgr, color, skip_top=0.0)
+        if cube_px is None:
+            log(f"  iter {it}: cubo NO visto")
+            break
 
-        if pixel is None:
-            log(f"  Servo muñeca: cubo {color} NO visible")
-            return False
+        # ── Delta en pixels ───────────────────────────────────────────────
+        du = cube_px[0] - aruco_px[0]
+        dv = cube_px[1] - aruco_px[1]
+        log(f"  iter {it}: ArUco={aruco_px} cubo={cube_px} Δpx=({du},{dv})")
 
-        err_u = pixel[0] / w - 0.5
-        err_v = pixel[1] / h - 0.5
+        if abs(du) < tol_px and abs(dv) < tol_px:
+            log(f"  Alineado (error < {tol_px}px)")
+            break
 
-        if abs(err_u) < tolerance and abs(err_v) < tolerance:
-            log(f"  Servo muñeca: {color} centrado {pixel}")
-            return True
+        # ── Profundidades ─────────────────────────────────────────────────
+        d_aruco_raw = depth_sample(dep, aruco_px[0], aruco_px[1])
+        d_cube_raw  = depth_sample(dep, cube_px[0],  cube_px[1])
+        d_aruco = d_aruco_raw * D435I_DEPTH_SCALE if d_aruco_raw > 0 else 0.5
+        d_cube  = d_cube_raw  * D435I_DEPTH_SCALE if d_cube_raw  > 0 else d_aruco
+
+        # ── Posiciones 3D en frame cámara ─────────────────────────────────
+        p_aruco = backproject(aruco_px[0], aruco_px[1], d_aruco)
+        p_cube  = backproject(cube_px[0],  cube_px[1],  d_cube)
+        delta_cam = p_cube - p_aruco
+        log(f"  delta_cam={np.round(delta_cam, 3)}")
+
+        # ── Convertir a frame mundo y aplicar corrección ──────────────────
+        R          = get_head_cam_R(sim)
+        delta_w    = R @ delta_cam
+        log(f"  delta_world={np.round(delta_w, 3)}")
+
+        # arm: componente a lo largo de la dirección del brazo
+        d_arm  = float(np.dot(delta_w[:2], arm_dir)) * 0.7   # ganancia < 1
+        # lift: componente vertical
+        d_lift = float(delta_w[2]) * 0.7
 
         st = sim.pull_status()
-        new_arm  = float(np.clip(st.arm.pos  + KP_ARM  * err_u, 0.0,  0.52))
-        new_lift = float(np.clip(st.lift.pos - KP_LIFT * err_v, 0.05, 1.0))
-        sim.move_to(Actuators.arm,  new_arm)
-        sim.move_to(Actuators.lift, new_lift)
-        time.sleep(0.15)
+        new_arm  = float(np.clip(st.arm.pos  + d_arm,  0.0, 0.52))
+        new_lift = float(np.clip(st.lift.pos + d_lift, 0.05, 1.0))
+        log(f"  → arm {st.arm.pos:.3f}→{new_arm:.3f}  lift {st.lift.pos:.3f}→{new_lift:.3f}")
+        move(sim, Actuators.arm,  new_arm,  timeout=5)
+        move(sim, Actuators.lift, new_lift, timeout=5)
+        time.sleep(0.3)
 
-    log(f"  Servo muñeca: no convergió para {color}")
+    # Restaurar wrist para el agarre
+    move(sim, Actuators.wrist_pitch, -0.9, timeout=4)
+
+# ── Servo fino con cámara de muñeca (D405) ───────────────────────────────────
+def servo_wrist_to_cube(sim, color, max_iters=25, tol=0.10):
+    """P-controller con D405: centra cubo ajustando arm (err_u) y lift (err_v)."""
+    KP = 0.02
+    log("  Servo muñeca D405...")
+    for _ in range(max_iters):
+        try:
+            frame = sim.pull_camera_data().get_camera_data(StretchCameras.cam_d405_rgb)
+        except Exception:
+            time.sleep(0.1); continue
+        h, w  = frame.shape[:2]
+        px    = find_cube_pixel(frame, color, skip_top=0.0)
+        if px is None: return False
+        eu, ev = px[0]/w - 0.5, px[1]/h - 0.5
+        if abs(eu) < tol and abs(ev) < tol:
+            log(f"  D405 centrado {px}")
+            return True
+        st = sim.pull_status()
+        sim.move_to(Actuators.arm,  float(np.clip(st.arm.pos  + KP*eu, 0.0, 0.52)))
+        sim.move_to(Actuators.lift, float(np.clip(st.lift.pos - KP*ev, 0.05, 1.0)))
+        time.sleep(0.15)
     return False
 
-# ── Geometría del brazo ───────────────────────────────────────────────────────
-
-def rotate_2d(v, angle):
-    c, s = np.cos(angle), np.sin(angle)
-    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
-
+# ── Geometría del brazo (calibración empírica) ────────────────────────────────
+def rotate_2d(v, a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([c*v[0]-s*v[1], s*v[0]+c*v[1]])
 
 def probe_arm_geometry(sim):
-    """Mide empíricamente la dirección del brazo y ratio lift→z."""
     log("Calibrando geometría del brazo...")
     move(sim, Actuators.lift, 0.5, timeout=10)
     move(sim, Actuators.arm,  0.0, timeout=10)
     time.sleep(0.5)
-
     ee0 = ee_pos(sim)
-    theta_cal = sim.pull_status().base.theta
-    log(f"  EE en lift=0.5 arm=0: {np.round(ee0, 3)}, base_theta={theta_cal:.3f} rad")
-
-    # Probar lift
+    th0 = sim.pull_status().base.theta
+    log(f"  EE home: {np.round(ee0,3)}  theta={th0:.3f}")
+    # lift ratio
     move(sim, Actuators.lift, 0.6, timeout=6)
-    dz_per_lift = (ee_pos(sim)[2] - ee0[2]) / 0.1
+    dz = (ee_pos(sim)[2] - ee0[2]) / 0.1
     move(sim, Actuators.lift, 0.5, timeout=6)
-    log(f"  dz/d_lift ≈ {dz_per_lift:.3f}")
-
-    # Probar dirección del brazo
-    move(sim, Actuators.arm, ARM_PROBE_DIST, timeout=8)
+    # arm direction
+    move(sim, Actuators.arm, ARM_PROBE_M, timeout=8)
     time.sleep(0.4)
-    d_arm = ee_pos(sim)[:2] - ee0[:2]
-    arm_dir = d_arm / (np.linalg.norm(d_arm) + 1e-9)
+    d_xy  = ee_pos(sim)[:2] - ee0[:2]
+    adir  = d_xy / (np.linalg.norm(d_xy) + 1e-9)
     move(sim, Actuators.arm, 0.0, timeout=8)
     time.sleep(0.3)
-    log(f"  Dirección del brazo (world xy): {np.round(arm_dir, 3)}")
+    log(f"  dz/lift={dz:.3f}  arm_dir={np.round(adir,3)}")
+    return adir, ee_pos(sim), dz, th0
 
-    ee_ref = ee_pos(sim)
-    return arm_dir, ee_ref, dz_per_lift, theta_cal
-
-
-def current_arm_dir(sim, arm_dir_cal, theta_cal):
-    """Corrige la dirección del brazo según el ángulo actual de la base."""
-    delta = sim.pull_status().base.theta - theta_cal
-    return rotate_2d(arm_dir_cal, delta)
+def current_arm_dir(sim, adir_cal, th_cal):
+    return rotate_2d(adir_cal, sim.pull_status().base.theta - th_cal)
 
 # ── Control de base ───────────────────────────────────────────────────────────
-
-def move_base_to(sim, tx, ty, tolerance=0.06, timeout=20.0):
-    KP_LIN, KP_ANG = 1.5, 3.0
+def move_base_to(sim, tx, ty, tol=0.06, timeout=20.0):
+    KP_L, KP_A = 1.5, 3.0
     t0 = time.time()
-    while time.time() - t0 < timeout:
+    while time.time()-t0 < timeout:
         st = sim.pull_status()
-        dx, dy = tx - st.base.x, ty - st.base.y
+        dx, dy = tx-st.base.x, ty-st.base.y
         dist = np.hypot(dx, dy)
-        if dist < tolerance:
-            break
-        ang_err = (np.arctan2(dy, dx) - st.base.theta + np.pi) % (2 * np.pi) - np.pi
-        v_lin = 0.0 if abs(ang_err) > 0.4 else min(KP_LIN * dist, 0.25)
-        sim.set_base_velocity(v_lin, KP_ANG * ang_err)
+        if dist < tol: break
+        ae = (np.arctan2(dy, dx)-st.base.theta+np.pi) % (2*np.pi) - np.pi
+        vl = 0.0 if abs(ae)>0.4 else min(KP_L*dist, 0.25)
+        sim.set_base_velocity(vl, KP_A*ae)
         time.sleep(0.04)
-    sim.set_base_velocity(0, 0)
-    time.sleep(0.3)
+    sim.set_base_velocity(0, 0); time.sleep(0.3)
     st = sim.pull_status()
-    log(f"  Base final: ({st.base.x:.3f}, {st.base.y:.3f})")
+    log(f"  Base: ({st.base.x:.3f}, {st.base.y:.3f})")
 
 # ── Pick and place ────────────────────────────────────────────────────────────
+def pick_and_place(sim, adir_cal, th_cal, dz_per_lift):
+    DESIRED_ARM = 0.35
 
-def pick_and_place(sim, arm_dir_cal, theta_cal, dz_per_lift):
-
-    DESIRED_ARM = 0.35   # extensión de brazo al posicionar la base
-
-    def refresh_refs():
-        """Después de mover la base, recalcula EE ref y dirección del brazo."""
+    def refresh():
         move(sim, Actuators.lift, 0.5, timeout=6)
         move(sim, Actuators.arm,  0.0, timeout=6)
         time.sleep(0.3)
-        ref = ee_pos(sim)
-        adir = current_arm_dir(sim, arm_dir_cal, theta_cal)
-        log(f"  EE ref: {np.round(ref, 3)} | arm_dir: {np.round(adir, 3)}")
+        ref  = ee_pos(sim)
+        adir = current_arm_dir(sim, adir_cal, th_cal)
+        log(f"  EE ref: {np.round(ref,3)} arm_dir: {np.round(adir,3)}")
         return ref, adir
 
-    def joints_for(target_xyz, ee_ref, adir, dz_offset=0.0):
-        """Calcula (lift, arm) para posicionar el EE en target_xyz."""
-        dz   = (target_xyz[2] + dz_offset) - ee_ref[2]
-        lift = float(np.clip(0.5 + dz / dz_per_lift, 0.05, 1.0))
-        arm  = float(np.clip(np.dot(target_xyz[:2] - ee_ref[:2], adir), 0.0, 0.50))
+    def joints_for(target, ref, adir, dz_off=0.0):
+        lift = float(np.clip(0.5+(target[2]+dz_off-ref[2])/dz_per_lift, 0.05, 1.0))
+        arm  = float(np.clip(np.dot(target[:2]-ref[:2], adir), 0.0, 0.50))
         return lift, arm
 
-    # ── 1. Detección con brazo retractado ────────────────────────────────────
-    log("Fase 1: detectando cubos (brazo retractado)...")
+    # ── 1. Preparar muñeca y abrir gripper ────────────────────────────────────
+    move(sim, Actuators.wrist_yaw,    0.0, timeout=5)
+    move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
+
+    # ── 2. Brazo retractado, detectar cubos ───────────────────────────────────
+    log("Fase 1: detectando cubos con cabeza (brazo adentro)...")
     move(sim, Actuators.arm,  0.0, timeout=8)
     move(sim, Actuators.lift, 0.5, timeout=8)
     time.sleep(0.4)
 
-    cube_blue = detect_cube_3d(sim, "blue", CUBE_BLUE_FALLBACK)
-    cube_red  = detect_cube_3d(sim, "red",  CUBE_RED_FALLBACK)
-    log(f"  → Azul: {np.round(cube_blue, 3)}")
-    log(f"  → Rojo: {np.round(cube_red,  3)}")
+    # Detectar cubo azul
+    point_head_at(sim, CUBE_BLUE_FB)
+    bgr, dep = get_head_frames(sim)
+    cube_blue = CUBE_BLUE_FB.copy()
+    px_b = find_cube_pixel(bgr, "blue")
+    if px_b:
+        d_raw = depth_sample(dep, px_b[0], px_b[1])
+        if d_raw > 0:
+            depth_m = d_raw * D435I_DEPTH_SCALE
+            TABLE_Z = 0.52
+            R = get_head_cam_R(sim)
+            # Posición de la cabeza
+            st = sim.pull_status(); theta = st.base.theta
+            head = np.array([st.base.x-0.1*np.cos(theta),
+                             st.base.y-0.1*np.sin(theta),
+                             st.lift.pos+0.20])
+            # ray-plane con depth
+            p_cam   = backproject(px_b[0], px_b[1], depth_m)
+            p_world = head + R @ p_cam
+            if -1.0 < p_world[0] < 1.0 and -1.5 < p_world[1] < 0.0 and 0.3 < p_world[2] < 0.8:
+                cube_blue = p_world
+    log(f"  Cubo azul: {np.round(cube_blue,3)}")
 
-    # ── 2. Preparar muñeca ────────────────────────────────────────────────────
-    move(sim, Actuators.wrist_pitch, -0.9, timeout=5)
-    move(sim, Actuators.wrist_yaw,    0.0, timeout=5)
-    move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
+    # Detectar cubo rojo
+    point_head_at(sim, CUBE_RED_FB)
+    bgr, dep = get_head_frames(sim)
+    cube_red = CUBE_RED_FB.copy()
+    px_r = find_cube_pixel(bgr, "red")
+    if px_r:
+        d_raw = depth_sample(dep, px_r[0], px_r[1])
+        if d_raw > 0:
+            depth_m = d_raw * D435I_DEPTH_SCALE
+            R = get_head_cam_R(sim)
+            st = sim.pull_status(); theta = st.base.theta
+            head = np.array([st.base.x-0.1*np.cos(theta),
+                             st.base.y-0.1*np.sin(theta),
+                             st.lift.pos+0.20])
+            p_cam   = backproject(px_r[0], px_r[1], depth_m)
+            p_world = head + R @ p_cam
+            if -1.0 < p_world[0] < 1.0 and -1.5 < p_world[1] < 0.0 and 0.3 < p_world[2] < 0.8:
+                cube_red = p_world
+    log(f"  Cubo rojo: {np.round(cube_red,3)}")
 
-    # ── 3. Posicionar base frente al cubo azul ────────────────────────────────
+    # ── 3. Posicionar base ────────────────────────────────────────────────────
     log("Fase 2: posicionando base frente al cubo azul...")
-    # Cabeza apunta al cubo durante el movimiento de base
     point_head_at(sim, cube_blue)
+    adir = current_arm_dir(sim, adir_cal, th_cal)
+    move_base_to(sim, cube_blue[0]-adir[0]*DESIRED_ARM,
+                      cube_blue[1]-adir[1]*DESIRED_ARM)
 
-    adir_now = current_arm_dir(sim, arm_dir_cal, theta_cal)
-    base_tgt = cube_blue[:2] - adir_now * DESIRED_ARM
-    move_base_to(sim, base_tgt[0], base_tgt[1])
-
-    # Re-detectar desde nueva posición con brazo adentro
-    log("  Re-detectando cubo azul desde nueva posición...")
-    move(sim, Actuators.arm, 0.0, timeout=5)
-    cube_blue2 = detect_cube_3d(sim, "blue", cube_blue)
-    if np.linalg.norm(cube_blue2 - cube_blue) < 0.30:
-        cube_blue = cube_blue2
-        log(f"  Posición azul refinada: {np.round(cube_blue, 3)}")
-
-    ee_ref, adir_now = refresh_refs()
-
-    # ── 4. Hover sobre cubo azul — cabeza apunta al EE ───────────────────────
-    log("Fase 3: hovering sobre cubo azul...")
-    lift_h, arm_h = joints_for(cube_blue, ee_ref, adir_now, dz_offset=0.08)
+    # ── 4. Hover inicial (estimado) ───────────────────────────────────────────
+    log("Fase 3: hover sobre cubo azul (posición estimada)...")
+    ee_ref, adir = refresh()
+    lift_h, arm_h = joints_for(cube_blue, ee_ref, adir, dz_off=0.08)
     log(f"  lift={lift_h:.3f}  arm={arm_h:.3f}")
     move(sim, Actuators.lift, lift_h, timeout=8)
     move(sim, Actuators.arm,  arm_h,  timeout=8)
-    # Apuntar cabeza al gripper ahora que está extendido
-    point_head_at(sim, ee_pos(sim))
-    time.sleep(0.3)
-    log(f"  EE real: {np.round(ee_pos(sim), 3)}")
+    log(f"  EE real: {np.round(ee_pos(sim),3)}")
 
-    # ── 7. Servo muñeca: ajuste fino con D405 ────────────────────────────────
-    log("Fase 6: servo fino con cámara de muñeca D405...")
+    # ── 5. ALINEACIÓN ARUCO + VISIÓN ──────────────────────────────────────────
+    # Cabeza mira al brazo, detecta ArUco de muñeca Y cubo en el mismo frame,
+    # itera hasta que gripper esté sobre el cubo.
+    log("Fase 4: alineación ArUco muñeca ↔ cubo azul...")
+    aruco_align_to_cube(sim, "blue", adir)
+
+    # ── 6. Servo fino D405 ────────────────────────────────────────────────────
+    log("Fase 5: servo fino con D405...")
+    move(sim, Actuators.wrist_pitch, -0.9, timeout=4)
+    point_head_at(sim, ee_pos(sim))
     servo_wrist_to_cube(sim, "blue")
 
-    # ── 8. Bajar al cubo y agarrar ────────────────────────────────────────────
-    log("Fase 7: bajando al cubo azul...")
-    # Posición post-servo: bajar desde donde quedó el servo
+    # ── 7. Bajar y agarrar ────────────────────────────────────────────────────
+    log("Fase 6: bajando y agarrando...")
     st = sim.pull_status()
-    lift_at_grasp = st.lift.pos - 0.06
-    move(sim, Actuators.lift, lift_at_grasp, timeout=6)
-    time.sleep(0.5)
-
-    log("Fase 7b: cerrando gripper...")
+    move(sim, Actuators.lift, st.lift.pos - 0.07, timeout=6)
+    time.sleep(0.4)
     move(sim, Actuators.gripper, GRIPPER_CLOSE, timeout=4)
     time.sleep(0.6)
 
-    check_wrist_cam(sim, "blue")
-
-    # ── 9. Levantar cubo ──────────────────────────────────────────────────────
-    log("Fase 8: levantando cubo azul...")
-    lift_carry = float(np.clip(lift_at_grasp + 0.22, 0.05, 1.0))
+    # ── 8. Levantar ───────────────────────────────────────────────────────────
+    st = sim.pull_status()
+    lift_carry = float(np.clip(st.lift.pos + 0.22, 0.05, 1.0))
+    log("Fase 7: levantando cubo azul...")
     move(sim, Actuators.lift, lift_carry, timeout=8)
     time.sleep(0.5)
 
-    # ── 10. Posicionar base frente al cubo rojo ───────────────────────────────
-    log("Fase 9: moviéndose al cubo rojo...")
-    adir_now = current_arm_dir(sim, arm_dir_cal, theta_cal)
-    base_tgt_r = cube_red[:2] - adir_now * DESIRED_ARM
-    move_base_to(sim, base_tgt_r[0], base_tgt_r[1])
-    ee_ref, adir_now = refresh_refs()
+    # ── 9. Ir al cubo rojo ────────────────────────────────────────────────────
+    log("Fase 8: moviéndose al cubo rojo...")
+    adir = current_arm_dir(sim, adir_cal, th_cal)
+    move_base_to(sim, cube_red[0]-adir[0]*DESIRED_ARM,
+                      cube_red[1]-adir[1]*DESIRED_ARM)
 
-    # ── 11. Hover sobre cubo rojo ─────────────────────────────────────────────
-    log("Fase 10: posicionando sobre cubo rojo...")
-    lift_o, arm_r = joints_for(cube_red, ee_ref, adir_now, dz_offset=0.10)
-    log(f"  lift={lift_o:.3f}  arm={arm_r:.3f}")
-    move(sim, Actuators.lift, lift_carry, timeout=6)   # mantener altura al mover brazo
-    move(sim, Actuators.arm,  arm_r, timeout=8)
-    move(sim, Actuators.lift, lift_o, timeout=8)
-    time.sleep(0.5)
-    log(f"  EE real: {np.round(ee_pos(sim), 3)}")
+    # Hover sobre rojo
+    move(sim, Actuators.arm, 0.0, timeout=6)
+    ee_ref, adir = refresh()
+    lift_o, arm_r = joints_for(cube_red, ee_ref, adir, dz_off=0.10)
+    move(sim, Actuators.lift, lift_carry, timeout=6)
+    move(sim, Actuators.arm,  arm_r,      timeout=8)
+    move(sim, Actuators.lift, lift_o,     timeout=8)
 
-    # ── 12. Soltar ────────────────────────────────────────────────────────────
-    log("Fase 11: soltando cubo azul sobre rojo...")
-    lift_p, _ = joints_for(cube_red, ee_ref, adir_now, dz_offset=0.06)
-    move(sim, Actuators.lift, lift_p, timeout=6)
+    # Servo fino D405 para el rojo
+    servo_wrist_to_cube(sim, "red")
+
+    # ── 10. Soltar ────────────────────────────────────────────────────────────
+    log("Fase 9: colocando cubo azul sobre rojo...")
+    st = sim.pull_status()
+    move(sim, Actuators.lift, st.lift.pos - 0.05, timeout=6)
     time.sleep(0.4)
     move(sim, Actuators.gripper, GRIPPER_OPEN, timeout=4)
     time.sleep(0.5)
 
-    # ── 13. Retirar ───────────────────────────────────────────────────────────
-    log("Fase 12: retirando brazo...")
+    # ── 11. Retirar ───────────────────────────────────────────────────────────
+    log("Fase 10: retirando...")
     move(sim, Actuators.lift, lift_carry, timeout=6)
-    move(sim, Actuators.arm,  0.0, timeout=6)
+    move(sim, Actuators.arm,  0.0,        timeout=6)
     time.sleep(1.0)
     log("¡Completado!")
 
-# ── Grabación de video compuesto 2×2 (todas las cámaras) ─────────────────────
-#
-#  ┌──────────────────┬──────────────────┐
-#  │  Head RGB        │  Head Depth      │
-#  │  (detección HSV) │  (colorizado)    │
-#  ├──────────────────┼──────────────────┤
-#  │  Wrist D405      │  Overhead        │
-#  │                  │  (3ra persona)   │
-#  └──────────────────┴──────────────────┘
+# ── Video compuesto 2×2 ───────────────────────────────────────────────────────
+CELL_W, CELL_H = VIDEO_W//2, VIDEO_H//2
 
-CELL_W, CELL_H = VIDEO_W // 2, VIDEO_H // 2   # 320 × 240 cada celda
-
-
-def _annotate_head_rgb(frame, blue_px, red_px, depth_blue, depth_red):
-    """Dibuja detecciones sobre el frame de cabeza RGB."""
-    out = frame.copy()
-    for px, color, bgr, depth in [
-        (blue_px, "blue", (255, 80,  0), depth_blue),
-        (red_px,  "red",  (0,  50, 255), depth_red),
-    ]:
-        if px:
-            cv2.circle(out, px, 14, bgr, 3)
-            label = f"{color} {depth:.2f}m" if depth else color
-            cv2.putText(out, label, (px[0] + 8, px[1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, bgr, 1)
-    return out
-
-
-def _colorize_depth(depth_raw):
-    """Convierte imagen de profundidad uint16 a BGR colorizado."""
-    if depth_raw is None:
-        return np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
-    norm = cv2.normalize(depth_raw, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    return cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
-
-
-def _safe_frame(cam_data, camera, fallback_shape):
-    try:
-        return cam_data.get_camera_data(camera).copy()
-    except Exception:
-        return np.zeros(fallback_shape, dtype=np.uint8)
-
+def _colorize_depth(dep):
+    if dep is None: return np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
+    n = cv2.normalize(dep, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    return cv2.applyColorMap(n, cv2.COLORMAP_TURBO)
 
 class VideoRecorder:
     def __init__(self, sim, path):
         self.sim = sim
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.writer = cv2.VideoWriter(path, fourcc, VIDEO_FPS, (VIDEO_W, VIDEO_H))
-        self.label = ""
+        self.writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*"mp4v"), VIDEO_FPS, (VIDEO_W, VIDEO_H))
+        self.label  = ""
         self._running = False
 
-    def _build_frame(self, cam_data):
-        """Construye el frame compuesto 2×2."""
-
-        # ── Head RGB con overlay de detección ────────────────────────────────
-        head_rgb = _safe_frame(cam_data, StretchCameras.cam_d435i_rgb,
-                               (D435I_H, D435I_W, 3))
-
-        # Detección y profundidad para el overlay
-        blue_px = find_cube_pixel(head_rgb, "blue")
-        red_px  = find_cube_pixel(head_rgb, "red")
-
-        depth_blue = depth_red = None
+    def _build(self, cam):
+        # Head RGB con detección
         try:
-            depth_raw = cam_data.get_camera_data(
-                StretchCameras.cam_d435i_depth, auto_rotate=False)
-            if blue_px:
-                d = depth_sample(depth_raw, blue_px[0], blue_px[1])
-                depth_blue = d * D435I_DEPTH_SCALE if d > 0 else None
-            if red_px:
-                d = depth_sample(depth_raw, red_px[0], red_px[1])
-                depth_red = d * D435I_DEPTH_SCALE if d > 0 else None
+            rgb_r = cam.get_camera_data(StretchCameras.cam_d435i_rgb,
+                                        auto_rotate=False, auto_correct_rgb=False)
+            head  = cv2.cvtColor(rgb_r, cv2.COLOR_RGB2BGR)
         except Exception:
-            depth_raw = None
+            head = np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
 
-        head_ann = _annotate_head_rgb(head_rgb, blue_px, red_px,
-                                      depth_blue, depth_red)
-        cv2.putText(head_ann, "Head RGB (D435i)", (4, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        # Dibujar ArUco
+        aruco_px, _ = detect_wrist_aruco(head)
+        if aruco_px:
+            cv2.circle(head, aruco_px, 16, (0, 255, 255), 3)
+            cv2.putText(head, "ArUco", (aruco_px[0]+8, aruco_px[1]-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,255), 1)
+        for col, bgr_c in [("blue",(255,80,0)), ("red",(0,50,255))]:
+            px = find_cube_pixel(head, col)
+            if px: cv2.circle(head, px, 12, bgr_c, 3)
+        cv2.putText(head, "Head RGB + ArUco", (4,14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
 
-        # ── Head Depth colorizado ─────────────────────────────────────────────
+        # Head Depth
         try:
-            dr = cam_data.get_camera_data(
-                StretchCameras.cam_d435i_depth, auto_rotate=False)
-            depth_color = _colorize_depth(dr)
-            for px, bgr in [(blue_px,(255,80,0)),(red_px,(0,50,255))]:
-                if px:
-                    cv2.circle(depth_color, px, 14, bgr, 3)
+            dep_r = cam.get_camera_data(StretchCameras.cam_d435i_depth,
+                                        auto_rotate=False, auto_correct_rgb=False)
+            depth = _colorize_depth(dep_r)
         except Exception:
-            depth_color = np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
-        cv2.putText(depth_color, "Head Depth (D435i)", (4, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+            depth = np.zeros((D435I_H, D435I_W, 3), dtype=np.uint8)
+        cv2.putText(depth, "Head Depth", (4,14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
 
-        # ── Wrist RGB (D405) ──────────────────────────────────────────────────
-        wrist = _safe_frame(cam_data, StretchCameras.cam_d405_rgb, (270, 480, 3))
-        wx = find_cube_pixel(wrist, "blue") or find_cube_pixel(wrist, "red")
-        if wx:
-            cv2.circle(wrist, wx, 14, (0, 255, 0), 3)
-        cv2.putText(wrist, "Wrist RGB (D405)", (4, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        # Wrist D405
+        try:
+            wrist = cam.get_camera_data(StretchCameras.cam_d405_rgb).copy()
+        except Exception:
+            wrist = np.zeros((270, 480, 3), dtype=np.uint8)
+        px = find_cube_pixel(wrist, "blue", skip_top=0.0)
+        if px: cv2.circle(wrist, px, 12, (0,255,0), 3)
+        cv2.putText(wrist, "Wrist D405", (4,14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
 
-        # ── Overhead ──────────────────────────────────────────────────────────
-        overhead = _safe_frame(cam_data, StretchCameras.cam_overhead,
-                               (VIDEO_H, VIDEO_W, 3))
-        cv2.putText(overhead, "Overhead", (4, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-
-        # ── Ensamblar grilla 2×2 ──────────────────────────────────────────────
-        tl = cv2.resize(head_ann,   (CELL_W, CELL_H))
-        tr = cv2.resize(depth_color,(CELL_W, CELL_H))
-        bl = cv2.resize(wrist,      (CELL_W, CELL_H))
-        br = cv2.resize(overhead,   (CELL_W, CELL_H))
-
-        top = np.hstack([tl, tr])
-        bot = np.hstack([bl, br])
-        grid = np.vstack([top, bot])
-
-        # Label de fase encima
+        # Overhead
+        try:
+            over = cam.get_camera_data(StretchCameras.cam_overhead).copy()
+        except Exception:
+            over = np.zeros((VIDEO_H, VIDEO_W, 3), dtype=np.uint8)
         if self.label:
-            cv2.putText(grid, self.label, (10, VIDEO_H - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2)
+            cv2.putText(over, self.label, (10, VIDEO_H//2-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,220,0), 2)
+        cv2.putText(over, "Overhead", (4,14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+
+        grid = np.vstack([
+            np.hstack([cv2.resize(head,  (CELL_W,CELL_H)),
+                       cv2.resize(depth, (CELL_W,CELL_H))]),
+            np.hstack([cv2.resize(wrist, (CELL_W,CELL_H)),
+                       cv2.resize(over,  (CELL_W,CELL_H))]),
+        ])
         return grid
 
     def _loop(self):
-        interval = 1.0 / VIDEO_FPS
+        interval = 1.0/VIDEO_FPS
         while self._running and self.sim.is_running():
             t0 = time.perf_counter()
             try:
-                cam_data = self.sim.pull_camera_data()
-                frame = self._build_frame(cam_data)
-                self.writer.write(frame)
+                self.writer.write(self._build(self.sim.pull_camera_data()))
             except Exception:
                 pass
-            time.sleep(max(0, interval - (time.perf_counter() - t0)))
+            time.sleep(max(0, interval-(time.perf_counter()-t0)))
 
     def start(self):
         self._running = True
@@ -753,42 +585,35 @@ class VideoRecorder:
         self.writer.release()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
 def main():
-    print("=" * 60)
-    print("Cube Stack Demo — Vision-Based")
-    print(f"  MUJOCO_GL = {os.environ.get('MUJOCO_GL', 'no seteado')}")
+    print("="*60)
+    print("Cube Stack — ArUco arm alignment + vision detection")
+    print(f"  MUJOCO_GL = {os.environ.get('MUJOCO_GL','no seteado')}")
     print(f"  Escena    = {SCENE_XML}")
     print(f"  Video     = {VIDEO_OUT}")
-    print("=" * 60)
+    print("="*60)
 
     sim = StretchMujocoSimulator(
-        scene_xml_path=SCENE_XML,
-        cameras_to_use=CAMERAS,
-        camera_hz=10,
-    )
+        scene_xml_path=SCENE_XML, cameras_to_use=CAMERAS, camera_hz=10)
 
     log("Iniciando simulación...")
     sim.start(headless=HEADLESS)
-
     if not sim.is_running():
-        log("ERROR: la simulación no arrancó.")
-        sys.exit(1)
+        log("ERROR: simulación no arrancó"); sys.exit(1)
 
     rec = VideoRecorder(sim, VIDEO_OUT)
     rec.start()
-    log(f"Grabando en: {VIDEO_OUT}")
 
     try:
         rec.label = "Estabilizando..."
         log("Esperando que los cubos caigan...")
         time.sleep(3.0)
 
-        rec.label = "Calibrando brazo..."
-        arm_dir, _, dz_per_lift, theta_cal = probe_arm_geometry(sim)
+        rec.label = "Calibrando..."
+        adir, _, dz, th0 = probe_arm_geometry(sim)
 
-        rec.label = "Pick and place (vision)..."
-        pick_and_place(sim, arm_dir, theta_cal, dz_per_lift)
+        rec.label = "Pick & place (ArUco+visión)..."
+        pick_and_place(sim, adir, th0, dz)
 
         rec.label = "Completado"
         time.sleep(3.0)
@@ -797,7 +622,7 @@ def main():
         log("Interrumpido.")
     finally:
         rec.stop()
-        log(f"Video guardado: {VIDEO_OUT}")
+        log(f"Video: {VIDEO_OUT}")
         sim.stop()
 
 if __name__ == "__main__":
