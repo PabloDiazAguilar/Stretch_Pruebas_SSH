@@ -1,7 +1,9 @@
 {
-  "enabled": false,
+  "enabled": true,
+  "headless": false,
   "task": "PnPCounterToCab",
   "layout": 0,
   "style": 0,
-  "_comment": "Set enabled to true to load RoboCasa kitchen environment. Task examples: PnPCounterToCab, PnPCounterToSink, PnPSinkToCounter, etc. Layout and style are integer IDs (0-9 typically)."
+  "camera_hz": 10,
+  "_comment": "headless: en Windows debe ser false para que las camaras funcionen (requiere contexto OpenGL). camera_hz: FPS de render de camaras (10 ahorra ~67% vs 30). Layout 0-9, style 0-11."
 }

@@ -25,6 +25,8 @@ class StatusStretchCameras:
 
     cam_nav_rgb: np.ndarray|None = None
 
+    cam_overhead: np.ndarray|None = None
+
     def get_all(self, *, auto_rotate: bool = True, auto_correct_rgb=True, use_depth_color_map=False)-> dict[StretchCameras, np.ndarray]:
         """Returns the camera `{StretchCameras: pixels}` that are available (not None).
 
@@ -75,6 +77,9 @@ class StatusStretchCameras:
             data = self.cam_nav_rgb
             data = np.rot90(data, 1) if auto_rotate else data
             data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
+        elif camera == StretchCameras.cam_overhead and self.cam_overhead is not None:
+            data = self.cam_overhead
+            data = cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if auto_correct_rgb else data
 
         if data is None:
             raise ValueError(f"Tried to get {camera} data, but it is empty or not implemented.")
@@ -102,7 +107,10 @@ class StatusStretchCameras:
         if camera == StretchCameras.cam_nav_rgb:
             self.cam_nav_rgb = data
             return
-        
+        if camera == StretchCameras.cam_overhead:
+            self.cam_overhead = data
+            return
+
         raise NotImplementedError(f"Camera {camera} is not implemented.")
 
     @staticmethod

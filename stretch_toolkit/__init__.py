@@ -105,7 +105,8 @@ if not USE_PHYSICAL:
             robocasa_config = _load_robocasa_config()
             
             # Prepare simulator initialization kwargs
-            sim_kwargs = {'cameras_to_use': []}  # Keep camera loading separate
+            camera_hz = robocasa_config.get('camera_hz', 30) if robocasa_config else 30
+            sim_kwargs = {'cameras_to_use': [], 'camera_hz': camera_hz}
             
             if robocasa_config:
                 # Generate robocasa model from config parameters
@@ -129,8 +130,9 @@ if not USE_PHYSICAL:
                     print("[stretch_toolkit] Falling back to default environment")
             
             # Initialize simulator (with or without robocasa model)
+            headless = robocasa_config.get('headless', False) if robocasa_config else False
             _sim = StretchMujocoSimulator(**sim_kwargs)
-            _sim.start()
+            _sim.start(headless=headless)
             _controller = SimulatedJointController(sim=_sim)
             
             # Start camera watchdog thread

@@ -20,6 +20,8 @@ class StretchCameras(Enum):
 
     cam_nav_rgb = 4
 
+    cam_overhead = 5  # static third-person camera defined in scene_cubes.xml
+
     def get_render_params(self):
         return (self.camera_name_in_mjcf, self.name, self.post_processing_callback)
 
@@ -67,6 +69,8 @@ class StretchCameras(Enum):
             return "d435i_camera_depth"
         if self == StretchCameras.cam_nav_rgb:
             return "nav_camera_rgb"
+        if self == StretchCameras.cam_overhead:
+            return "overhead_rgb"
 
         raise NotImplementedError(f"Camera {self} camera_name_in_mjcf is not implemented")
 
@@ -78,6 +82,7 @@ class StretchCameras(Enum):
             self == StretchCameras.cam_d405_rgb
             or self == StretchCameras.cam_d435i_rgb
             or self == StretchCameras.cam_nav_rgb
+            or self == StretchCameras.cam_overhead
         ):
             return False
 
@@ -96,6 +101,7 @@ class StretchCameras(Enum):
             self == StretchCameras.cam_d405_rgb
             or self == StretchCameras.cam_d435i_rgb
             or self == StretchCameras.cam_nav_rgb
+            or self == StretchCameras.cam_overhead
         ):
             return None
 
@@ -151,6 +157,15 @@ class StretchCameras(Enum):
                 height=600,  # from webteleop
                 sensor_resolution=(1280, 720),  # from ov9782 spec
                 # sensor_pixel_size_micrometers=3.0 # from ov9782 spec, note: enabling this will not work with 0 `focal`
+            )
+
+        if self == StretchCameras.cam_overhead:
+            # Static third-person camera defined in scene_cubes.xml worldbody
+            return CameraSettings(
+                field_of_view_vertical_in_degrees=60,
+                focal=(415.7, 415.7),  # fy = (height/2) / tan(fovy/2) = 240/tan(30°) ≈ 415
+                width=640,
+                height=480,
             )
 
         raise NotImplementedError(f"Camera {self} initial settings are not implemented")
